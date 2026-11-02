@@ -1,0 +1,8 @@
+# dsh-obsidian knowledge workspace bundle patch.
+#
+# Embeds the dsh-obsidian plugin into DSH Desktop:
+# - Host half: knowledge sources, indexer, search, link graph, proposal inbox.
+# - Client half: `sidebar.panellist` entry `knowledge` + root `main` keyed panel.
+- insert:
+    - id: dsh-obsidian
+      name: 'dsh-obsidian'

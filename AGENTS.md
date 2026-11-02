@@ -1,0 +1,7 @@
+# Project development constraints
+
+- This repository's plugin targets **DSH Desktop only**, and the compatibility baseline is the **installed** DSH runtime (currently `@deepseek-ai/dsh-desktop-runtime 0.2.1-rc.5`, DSH Desktop 2.0.18 nightly). Design, implementation, default keybindings, and acceptance checks must use that installed contract, with every claim backed by source evidence.
+- dsh-obsidian is an **independent** plugin: it must run without `dsh-enhanced`, and must not depend on it. It reuses DSH native file capabilities (resource navigation, Preview) and does not build a second file manager.
+- Host APIs must be verified from the unpacked installed source (`/tmp/dsh-src/dsh/node_modules/@deepseek-ai/*`) or from README/package.json in the live installation. Distinguish "API exists" from "actually wired/called". Do not assume Obsidian/VS Code plugin conventions apply to DSH.
+- Build and test the plugin before reporting it works. Distinguish mocked/DOM tests from verification inside a running DSH Desktop instance. Do not commit, push, publish, or change the user's Desktop profile without separate explicit authorization.
+- Submission account by platform: **zhizhi-2986** for GitHub, **南京-刘阳** for GitLab. The user has authorized one push of the initialized repository to `https://github.com/Zhizhi-2986/dsh-obsidian-dashboard.git` without a user-story number; later commits/pushes need separate confirmation.
