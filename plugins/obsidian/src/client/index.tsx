@@ -11,11 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
-import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import type {} from '@deepseek-ai/dsh-api-session-controller/client'
-import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import type {} from '@deepseek-ai/dsh-client-shortcuts/client'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 import { TYPERT_REMOTE, knowledgeRpcOf } from './remote.ts'
@@ -31,9 +27,6 @@ export const inject = [
   'connection',
   'configForms',
   'shortcuts',
-  'sidebarRight',
-  'sessions',
-  'uiSession',
 ]
 
 export async function apply(ctx: ClientContext): Promise<void> {
@@ -42,38 +35,38 @@ export async function apply(ctx: ClientContext): Promise<void> {
 
   ctx.effect(() => ctx.locale.register(NS, dictionaries), 'dsh-obsidian: dictionaries')
 
-  const rpc = knowledgeRpcOf(ctx)
+  ctx.inject(['remote.knowledge'], (remoteCtx) => {
+    const rpc = knowledgeRpcOf(remoteCtx)
 
-  ctx.inject(['slots'], (slotCtx) => {
-    slotCtx.effect(() => {
-      const disposers = [
-        slotCtx.slots.inject('sidebar.panellist', () => slotCtx.slots.register(
-          { name: 'sidebar.panellist', id: 'knowledge', order: 20, label: () => slotCtx.locale.bind(NS)('panelLabel') },
-          KnowledgeIcon,
-        )),
-        slotCtx.slots.inject('main', () => slotCtx.slots.register(
-          { name: 'main', key: 'knowledge' },
-          () => <KnowledgePanelView ctx={ctx} rpc={rpc} />,
-        )),
-      ]
-      return () => disposers.forEach((dispose) => dispose())
-    }, 'dsh-obsidian: knowledge panels')
-  })
+    ctx.inject(['slots'], (slotCtx) => {
+      slotCtx.effect(() => {
+        const disposers = [
+          slotCtx.slots.inject('sidebar.panellist', () => slotCtx.slots.register(
+            { name: 'sidebar.panellist', id: 'knowledge', order: 20, label: () => slotCtx.locale.bind(NS)('panelLabel') },
+            KnowledgeIcon,
+          )),
+          slotCtx.slots.inject('main', () => slotCtx.slots.register(
+            { name: 'main', key: 'knowledge' },
+            () => <KnowledgePanelView ctx={ctx} rpc={rpc} />,
+          )),
+        ]
+        return () => disposers.forEach((dispose) => dispose())
+      }, 'dsh-obsidian: knowledge panels')
+    })
 
-  ctx.inject(['configForms'], (formCtx) => {
-    const settings = formCtx.configForms.get<ObsidianSettings>(NS)
-    formCtx.effect(() => {
-      return formCtx.configForms.whileServed([NS], () => formCtx.slots.inject('plugins.item', () => formCtx.slots.register(
-        {
-          name: 'plugins.item',
-          id: 'dsh-obsidian-settings',
-          order: 30,
-          label: () => formCtx.locale.bind(NS)('settingsTitle'),
-          locale: NS,
-          registrant: 'dsh-obsidian',
-        },
-        (props) => <KnowledgeSettingsCard ctx={ctx} rpc={rpc} scope={settings} {...props} />,
-      )))
-    }, 'dsh-obsidian: settings card')
+    ctx.inject(['configForms'], (formCtx) => {
+      const settings = formCtx.configForms.get<ObsidianSettings>(NS)
+      formCtx.effect(() => {
+        return formCtx.configForms.whileServed([NS], () => formCtx.slots.inject('plugins.bundle.config', () => formCtx.slots.register(
+          {
+            name: 'plugins.bundle.config',
+            key: 'dsh-obsidian',
+            locale: NS,
+            registrant: 'dsh-obsidian',
+          },
+          (props) => <KnowledgeSettingsCard scope={settings} {...props} />,
+        )))
+      }, 'dsh-obsidian: settings card')
+    })
   })
 }

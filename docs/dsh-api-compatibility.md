@@ -99,7 +99,7 @@ renderSlot("main", {}, { entryKey: usePanelInfo((info) => info.activePanelId) ??
 - **源目录边界**：RPC 路径先做 lexical normalization，再解析 source root / parent / leaf 的真实路径；拒绝 traversal 与 symlink leaf，并确认 rc.5 `dsh-fs-local` 的稳定 target identity 等于已校验的 canonical path。stat/read/write 使用同一个已解析 `FsTarget`（`src/host/source-path.ts`、`src/host/knowledge-service.ts`）。
 - **变更同步（K-10）**：当前索引运行时通过 `node:fs.watch` 递归监听（darwin），启动失败或后续 watcher error 时降级为 30 秒轮询；变更经防抖后增量同步并刷新链接图（`src/host/knowledge-source.ts`）。这不是 `ctx.fs.watch` 的调用链。完整扫描若遇 root 缺失或 I/O 错误会保留旧索引并记录错误，而不是把不完整目录当成空源。
 - **全文索引**：宿主无内置 FTS；当前实现使用 Node 22 `node:sqlite` 的 FTS5（`src/host/indexer.ts`），数据库放在插件数据目录。插件数据文件（索引、收件箱）以 `node:fs` 管理；知识源提案写入仍走 `ctx.fs`。
-- **目录选择器**：本次基线未找到可用的公开 picker client 服务；当前设置卡采用手动输入路径。
+- **目录选择器（2026-11-03 修正）**：rc.5 Desktop 内置 native flow 优先调用 `globalThis.__DSH_DIRECTORY_PICKER__.pick()`；其 preload 经 IPC 调用 Electron `dialog.showOpenDialog`。设置卡现在复用该内部桥接，并在桥接缺失时尝试 `uiWorkspace.pickDirectory()`；选择器实际弹窗仍需 Desktop 实机验证。选择目录不等同于授予沙箱写权限。
 
 ## 5. Agent 工具 / RPC / 设置（审计 D）
 
@@ -116,9 +116,9 @@ ctx.tools.register(defineTool({
 - 先例：`dsh-tool-cordis`（只读 inspector 工具）。
 - 当前插件注册的工具为 `knowledge_search` / `knowledge_read`（`src/host/tools.ts`），均为只读；收件箱提案经 Client RPC + UI 审阅，不注册 `knowledge_capture` 或可直接覆盖知识库的 Agent 工具。
 
-**Client–Host RPC**：typert protocol（`@deepseek-ai/dsh-typert-protocol`）。Host `KnowledgeService` 提供列源、索引、搜索、读文档、提案/列举/应用/忽略收件箱 RPC；Client 通过 `ctx.remote.$mount(TYPERT_REMOTE)` 挂载，并在每个调用上携带 `workspaceFileScope` lookup 参数（`src/host/knowledge-service.ts`、`src/client/remote.ts`）。
+**Client–Host RPC**：typert protocol（`@deepseek-ai/dsh-typert-protocol`）。Host `KnowledgeService` 提供列源、目录浏览、索引、搜索、读文档、提案/列举/应用/忽略收件箱 RPC；Client 通过 `ctx.remote.$mount(TYPERT_REMOTE)` 挂载，随后须 `ctx.inject(['remote.knowledge'], ...)` 才能访问该 namespace。知识索引是 profile-scoped，不依赖活动 Session，因此这些调用不携带 `workspaceFileScope`（`src/host/knowledge-service.ts`、`src/client/remote.ts`、`src/client/index.tsx`）。
 
-**设置持久化**：`ctx.configForms.get<ObsidianSettings>(NS)` 获取 ConfigForm；配置字段以 `.volatile()` 声明。设置卡注册在 `plugins.item` slot，且使用 `configForms.whileServed([NS], ...)` 绑定设置命名空间服务周期（`src/client/index.tsx`）。
+**设置持久化**：`ctx.configForms.get<ObsidianSettings>(NS)` 获取 ConfigForm；配置字段以 `.volatile()` 声明。rc.5 将这些 Config 值以 `Volatile<T>` reference 传给 Host `apply`，需经 `.get()` 解包；`loader/volatile-update` 在无 remount 时通知 Host 对知识源快照做增量重建（`src/host/config.ts`、`src/index.ts`）。设置卡注册在 `plugins.bundle.config` slot，并使用 `configForms.whileServed([NS], ...)` 绑定命名空间服务周期（`src/client/index.tsx`）。
 
 ## 6. 风险清单与实施建议
 
@@ -136,7 +136,8 @@ ctx.tools.register(defineTool({
 ## 7. 阶段 1 边界（依审计收敛）
 
 - **入口**：`sidebar.panellist`（id `knowledge`）+ `main` keyed panel（key `knowledge`）。
-- **知识源（当前实现）**：设置卡手动录入目录路径；Host 用 `node:fs` 扫描和读取文件，支持 include/exclude 与常见忽略目录；无 picker client 服务，未实现目录选择器。
+- **知识源（当前实现）**：设置卡在 DSH Desktop 中使用内置 native bridge 选择目录（桥接缺失时回退到 `uiWorkspace.pickDirectory()`，也可手动输入）；Host 用 `node:fs` 扫描和读取文件，支持 include/exclude 与常见忽略目录。
+- **知识 UI / 搜索（当前实现）**：Client 提供“检索 / 浏览 / 收件箱”入口；浏览视图从索引按目录逐层列出子目录和笔记。检索失败在面板中显式显示；知识 RPC 为 profile-scoped，不要求活动 Session。
 - **打开文件（当前实现）**：工作区内文件通过 `sidebarRight.openResource(dsh-resource://file/session/...)` 交给原生资源视图；工作区外 Vault 文件不伪造 session 资源地址。
 - **写入（当前实现）**：收件箱审阅后通过 `ctx.fs.writeText` + 版本守卫写入，失败保留/标记提案状态；不绕过 sandbox。差异预览尚未实现。
 - **Agent（当前实现）**：仅注册只读检索/读取工具；提案写入只能由 UI 收件箱审核流发起。

@@ -1,6 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
+import { Context } from '@deepseek-ai/cordis'
+import { KnowledgeService } from '../lib/host/knowledge-service.js'
+import { registerKnowledgeTools } from '../src/host/tools.ts'
+import { settingsFromConfig } from '../src/host/config.ts'
+import { ObsidianConfig, defaults } from '../src/shared/settings-contract.ts'
+import { mkdtemp, mkdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseNote, digestNote, resolveLinkTarget } from '../src/host/markdown.ts'
@@ -9,7 +15,6 @@ import { KnowledgeSourceRuntime } from '../src/host/knowledge-source.ts'
 import { resolveContainedPath } from '../src/host/source-path.ts'
 import { scanSource, fileStemOf, toSourceRel } from '../src/host/scanner.ts'
 import { InboxStore } from '../src/host/inbox-store.ts'
-import { sessionFileAddress } from '../src/client/resource-address.ts'
 import { uniqueSourceId } from '../src/client/source-id.ts'
 import { MAX_INBOX_ITEMS } from '../src/shared/rpc-contract.ts'
 
@@ -21,6 +26,86 @@ async function withTempDir(run) {
     await rm(dir, { recursive: true, force: true })
   }
 }
+
+test('host settings reader unwraps the Volatile values returned by rc.5 Config', () => {
+  const parsed = ObsidianConfig['~standard'].validate({})
+  assert.equal('issues' in parsed, false)
+  assert.equal(typeof parsed.value.knowledgeSources.get, 'function')
+  assert.deepEqual(settingsFromConfig(parsed.value), defaults())
+})
+
+test('knowledge-page source management persists a source and rejects duplicate paths', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    const dataDir = join(root, 'plugin-data')
+    await mkdir(sourcePath)
+    const ctx = new Context()
+    const service = new KnowledgeService(ctx, defaults(), dataDir)
+    const remoteView = ctx.extend({ invocation: { namespace: 'knowledge', method: 'addSource' } }).get('knowledge')
+    try {
+      const cancelled = new AbortController()
+      cancelled.abort()
+      await assert.rejects(remoteView.addSource({ name: 'Cancelled', path: sourcePath, kind: 'folder' }, cancelled.signal), { name: 'AbortError' })
+
+      const added = await remoteView.addSource({ name: 'Obsidian Vault', path: sourcePath, kind: 'folder' })
+      assert.equal(added.ok, true)
+      if (!added.ok) return
+      assert.equal(added.source.name, 'Obsidian Vault')
+
+      const duplicate = await remoteView.addSource({ name: 'Second name', path: sourcePath, kind: 'folder' })
+      assert.equal(duplicate.ok, false)
+      if (!duplicate.ok) assert.equal(duplicate.code, 'ALREADY_EXISTS')
+
+      const sources = await remoteView.listSources()
+      assert.equal(sources.ok, true)
+      if (sources.ok) assert.deepEqual(sources.sources.map(({ id, name }) => ({ id, name })), [{ id: added.source.id, name: 'Obsidian Vault' }])
+    } finally {
+      await service.shutdown()
+    }
+
+    const reloadedContext = new Context()
+    const reloaded = new KnowledgeService(reloadedContext, defaults(), dataDir)
+    const reloadedRemoteView = reloadedContext.extend({ invocation: { namespace: 'knowledge', method: 'listSources' } }).get('knowledge')
+    try {
+      const sources = await reloadedRemoteView.listSources()
+      assert.equal(sources.ok, true)
+      if (sources.ok) assert.equal(sources.sources[0]?.name, 'Obsidian Vault')
+      if (sources.ok && sources.sources[0]) {
+        const removed = await reloadedRemoteView.removeSource(sources.sources[0].id)
+        assert.equal(removed.ok, true)
+        const afterRemove = await reloadedRemoteView.listSources()
+        assert.equal(afterRemove.ok, true)
+        if (afterRemove.ok) assert.deepEqual(afterRemove.sources, [])
+      }
+    } finally {
+      await reloaded.shutdown()
+    }
+  })
+})
+
+test('knowledge-page source management rejects invalid or missing folders', async () => {
+  await withTempDir(async (root) => {
+    const dataDir = join(root, 'plugin-data')
+    const regularFile = join(root, 'note.md')
+    await writeFile(regularFile, '# note')
+    const service = new KnowledgeService(new Context(), defaults(), dataDir)
+    try {
+      const relative = await service.addSource({ name: 'Relative', path: 'vault', kind: 'folder' })
+      assert.equal(relative.ok, false)
+      if (!relative.ok) assert.equal(relative.code, 'INVALID')
+
+      const file = await service.addSource({ name: 'Not a folder', path: regularFile, kind: 'folder' })
+      assert.equal(file.ok, false)
+      if (!file.ok) assert.equal(file.code, 'INVALID')
+
+      const missing = await service.addSource({ name: 'Missing', path: join(root, 'missing'), kind: 'folder' })
+      assert.equal(missing.ok, false)
+      if (!missing.ok) assert.equal(missing.code, 'NOT_FOUND')
+    } finally {
+      await service.shutdown()
+    }
+  })
+})
 
 test('markdown parser extracts frontmatter, headings, wikilinks, tags, and plain text', () => {
   const note = parseNote(`---\ntitle: "Frontmatter title"\ntags: [one, two]\n---\n# Heading title\nBody with [[Other note|alias]] and #knowledge.\n\`\`\`\n#ignored [[ignored]]\n\`\`\``)
@@ -46,6 +131,19 @@ test('FTS query quotes terms and strips FTS punctuation', () => {
   assert.equal(toFtsQuery('alpha beta'), '"alpha" OR "beta"')
   assert.equal(toFtsQuery('"foo"* (bar)'), '"foo" OR "bar"')
   assert.equal(toFtsQuery('  ***  '), '')
+})
+
+test('SQLite index initializes a fresh plugin data directory', async () => {
+  await withTempDir(async (root) => {
+    const file = join(root, 'plugins', 'dsh-obsidian', 'knowledge.db')
+    const index = KnowledgeIndex.open(file)
+    try {
+      index.upsertDoc('vault', 'note.md', 'Note', [], 'content', 1)
+      assert.equal(index.countDocs('vault'), 1)
+    } finally {
+      index.close()
+    }
+  })
 })
 
 test('SQLite index round-trips docs, searches with highlights, tracks links, and deletes', () => {
@@ -77,6 +175,25 @@ test('SQLite index round-trips docs, searches with highlights, tracks links, and
   }
 })
 
+test('SQLite index lists immediate folders and notes for directory browsing', () => {
+  const index = KnowledgeIndex.open(':memory:')
+  try {
+    index.upsertDoc('vault', 'root.md', 'Root note', [], 'root', 1)
+    index.upsertDoc('vault', 'notes/a.md', 'A note', ['a'], 'a', 2)
+    index.upsertDoc('vault', 'notes/nested/b.md', 'B note', [], 'b', 3)
+    assert.deepEqual(index.listDirectory('vault', ''), {
+      directories: ['notes'],
+      documents: [{ sourceId: 'vault', path: 'root.md', title: 'Root note', tags: [], updatedAt: 1 }],
+    })
+    assert.deepEqual(index.listDirectory('vault', 'notes'), {
+      directories: ['nested'],
+      documents: [{ sourceId: 'vault', path: 'notes/a.md', title: 'A note', tags: ['a'], updatedAt: 2 }],
+    })
+  } finally {
+    index.close()
+  }
+})
+
 test('recursive watcher refreshes links after edits and target creation', { skip: process.platform !== 'darwin' }, async () => {
   await withTempDir(async (root) => {
     const sourceDir = join(root, 'source')
@@ -91,7 +208,10 @@ test('recursive watcher refreshes links after edits and target creation', { skip
       await runtime.sync()
       assert.equal(index.backLinks('vault', 'B.md').length, 1)
       runtime.startWatch()
-      await writeFile(join(sourceDir, 'a.md'), 'See [[C]].')
+      const editedNote = join(sourceDir, 'a.md')
+      await writeFile(editedNote, 'See [[C]].')
+      const now = new Date()
+      await utimes(editedNote, now, new Date(now.getTime() + 2_000))
       assert.equal(await waitFor(() => index.backLinks('vault', 'B.md').length === 0), true)
       await writeFile(join(sourceDir, 'C.md'), '# C')
       assert.equal(await waitFor(() => index.outLinks('vault', 'a.md')[0]?.resolvedPath === 'C.md'), true)
@@ -175,11 +295,164 @@ test('source ids are unique even when names normalize to the same slug', () => {
   assert.equal(uniqueSourceId('---', ['source']), 'source-2')
 })
 
-test('resource addresses percent-encode session ids and every path segment', () => {
-  assert.equal(
-    sessionFileAddress('session id', 'notes/a #b:c.md'),
-    'dsh-resource://file/session/session%20id/notes/a%20%23b:c.md',
-  )
+test('reads source documents for the Knowledge preview without a DSH fs service', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    await writeFile(join(sourcePath, 'note.md'), '# Knowledge preview\nBody text')
+    const config = {
+      ...defaults(),
+      knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }],
+    }
+    const service = new KnowledgeService(new Context(), config, join(root, 'plugin-data'))
+    try {
+      const document = await service.readSource('vault', 'note.md')
+      assert.equal(document.ok, true)
+      if (document.ok) assert.equal(document.content, '# Knowledge preview\nBody text')
+    } finally {
+      await service.shutdown()
+    }
+  })
+})
+
+test('agent tools register schemas compiled by the DSH tool factory', () => {
+  const registered = []
+  const ctx = {
+    tools: {
+      register(definition) {
+        assertSupportedJsonSchema(definition.output.schema)
+        registered.push(definition)
+      },
+    },
+  }
+  assert.doesNotThrow(() => registerKnowledgeTools(ctx, {}))
+  assert.deepEqual(registered.map((tool) => tool.name), ['knowledge_search', 'knowledge_read', 'knowledge_propose'])
+  for (const tool of registered) {
+    assert.equal(tool.parameters.type, 'object')
+    assert.doesNotThrow(() => assertSupportedJsonSchema(tool.parameters))
+    assert.doesNotThrow(() => assertSupportedJsonSchema(tool.output.schema))
+  }
+  const proposal = registered.find(({ name }) => name === 'knowledge_propose')
+  assert.deepEqual(proposal.parameters.required, ['kind', 'title', 'sourceId', 'targetPath', 'body'])
+  assert.deepEqual(proposal.parameters.properties.kind.enum, ['create', 'append', 'update'])
+})
+
+test('knowledge_propose creates only a pending proposal and never writes the source', async () => {
+  const calls = []
+  const service = {
+    async propose(sourceId, input) {
+      calls.push({ sourceId, input })
+      return {
+        ok: true,
+        item: { id: 'proposal-1', title: input.title, kind: input.kind, sourceId, targetPath: input.targetPath, status: 'pending' },
+      }
+    },
+  }
+  const registered = []
+  registerKnowledgeTools({ tools: { register: (definition) => registered.push(definition) } }, service)
+  const tool = registered.find(({ name }) => name === 'knowledge_propose')
+  assert.ok(tool, 'knowledge_propose is registered')
+  const draft = {
+    kind: 'create', title: 'Indexing notes', sourceId: 'vault', targetPath: 'notes/indexing.md', body: '# Indexing notes\\nDraft body',
+  }
+
+  const result = await tool.execute(draft)
+
+  assert.deepEqual(calls, [{ sourceId: 'vault', input: draft }])
+  assert.deepEqual(result, {
+    ok: true, itemId: 'proposal-1', title: 'Indexing notes', kind: 'create',
+    sourceId: 'vault', targetPath: 'notes/indexing.md', status: 'pending',
+  })
+  assert.equal('body' in result, false)
+})
+
+test('knowledge_propose returns service validation failures without claiming a draft was created', async () => {
+  const registered = []
+  const service = { async propose() { return { ok: false, code: 'INVALID', message: 'target resolves outside the configured source' } } }
+  registerKnowledgeTools({ tools: { register: (definition) => registered.push(definition) } }, service)
+  const tool = registered.find(({ name }) => name === 'knowledge_propose')
+  assert.ok(tool, 'knowledge_propose is registered')
+
+  const result = await tool.execute({
+    kind: 'create', title: 'Unsafe', sourceId: 'vault', targetPath: '../outside.md', body: 'No write',
+  })
+
+  assert.deepEqual(result, { ok: false, code: 'INVALID', message: 'target resolves outside the configured source' })
+})
+
+test('knowledge_propose uses the real service to enforce source containment before inboxing a draft', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    const dataDir = join(root, 'plugin-data')
+    await mkdir(join(sourcePath, 'notes'), { recursive: true })
+    const outsidePath = join(root, 'outside.md')
+    await writeFile(outsidePath, 'outside source')
+    await symlink(outsidePath, join(sourcePath, 'linked.md'))
+
+    const resolvedPaths = []
+    let writeCalls = 0
+    const context = new Context()
+    context.fs = {
+      async resolve(targetPath) {
+        resolvedPaths.push(targetPath)
+        return { path: targetPath }
+      },
+      async stat() { return undefined },
+      async writeText() { writeCalls += 1; throw new Error('propose must not write') },
+    }
+    const service = new KnowledgeService(context, {
+      ...defaults(),
+      knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }],
+    }, dataDir)
+    const registered = []
+    registerKnowledgeTools({ tools: { register: (definition) => registered.push(definition) } }, service)
+    const tool = registered.find(({ name }) => name === 'knowledge_propose')
+    assert.ok(tool, 'knowledge_propose is registered')
+
+    try {
+      const accepted = await tool.execute({
+        kind: 'create', title: 'Safe draft', sourceId: 'vault', targetPath: 'notes/safe.md', body: '# safe',
+      })
+      assert.equal(accepted.ok, true)
+      if (accepted.ok) assert.equal(accepted.status, 'pending')
+
+      const rejected = await tool.execute({
+        kind: 'create', title: 'Escaping link', sourceId: 'vault', targetPath: 'linked.md', body: '# unsafe',
+      })
+      assert.deepEqual(rejected, { ok: false, code: 'INVALID', message: 'target resolves outside the configured source' })
+
+      const unknownSource = await tool.execute({
+        kind: 'create', title: 'Unknown source', sourceId: 'missing', targetPath: 'notes/no.md', body: '# no',
+      })
+      assert.deepEqual(unknownSource, { ok: false, code: 'NOT_FOUND', message: 'unknown knowledge source' })
+
+      const inbox = await service.listInboxItems()
+      assert.equal(inbox.ok, true)
+      if (inbox.ok) assert.deepEqual(inbox.items.map(({ title, targetPath, status }) => ({ title, targetPath, status })), [
+        { title: 'Safe draft', targetPath: 'notes/safe.md', status: 'pending' },
+      ])
+      assert.equal(resolvedPaths.length, 1, 'only the contained target reaches DSH fs.resolve')
+      assert.equal(writeCalls, 0)
+    } finally {
+      await service.shutdown()
+    }
+  })
+})
+
+test('knowledge_propose rejects malformed arguments before calling the service', async () => {
+  let called = false
+  const registered = []
+  const service = { async propose() { called = true; return { ok: true, item: { id: 'unexpected' } } } }
+  registerKnowledgeTools({ tools: { register: (definition) => registered.push(definition) } }, service)
+  const tool = registered.find(({ name }) => name === 'knowledge_propose')
+  assert.ok(tool, 'knowledge_propose is registered')
+
+  const result = await tool.execute({
+    kind: 'create', title: '', sourceId: 'vault', targetPath: 'notes/foo.md', body: 'draft', extra: 'ignored?',
+  })
+
+  assert.equal(called, false)
+  assert.deepEqual(result, { ok: false, code: 'INVALID', message: 'invalid proposal input' })
 })
 
 test('inbox persists drafts, updates state, and trims resolved items before pending items', async () => {

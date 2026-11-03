@@ -1,17 +1,20 @@
-/** Read-only Agent tools for dsh-obsidian.
+/** Agent tools for dsh-obsidian.
  *
- * Writes are deliberately NOT exposed to the Agent: the design mandates
- * review-before-write through the proposal inbox (UI-gated). Only the
- * indexed search and document read surface reach the Agent loop.
+ * Agents can search/read notes and submit bounded proposals to the review inbox.
+ * They cannot write source files: only a user action in the UI applies a proposal.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-tools'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { ProposeInputSchema, type ProposeInput } from '../shared/rpc-contract.ts'
 import type { KnowledgeService } from './knowledge-service.ts'
 
+type ToolJson = null | boolean | number | string | ToolJson[] | { [key: string]: ToolJson }
+
 export function registerKnowledgeTools(ctx: Context, service: KnowledgeService): void {
-  ctx.tools.register(defineKnowledgeSearch(service))
-  ctx.tools.register(defineKnowledgeRead(service))
+  ctx.tools.register(defineTool(defineKnowledgeSearch(service)))
+  ctx.tools.register(defineTool(defineKnowledgeRead(service)))
+  ctx.tools.register(defineTool(defineKnowledgePropose(service)))
 }
 
 function defineKnowledgeSearch(service: KnowledgeService) {
@@ -48,7 +51,7 @@ function defineKnowledgeSearch(service: KnowledgeService) {
         text: JSON.stringify(value, null, 2),
       }],
     },
-    async execute(args: { query: string; sourceId?: string; field?: 'body' | 'title' | 'tags' | 'all'; limit?: number }) {
+    async execute(args: { query: string; sourceId?: string; field?: 'body' | 'title' | 'tags' | 'all'; limit?: number }): Promise<ToolJson> {
       const result = await service.searchSources(args.query, {
         sourceId: args.sourceId,
         field: args.field,
@@ -70,7 +73,7 @@ function defineKnowledgeSearch(service: KnowledgeService) {
         truncated: result.truncated,
       }
     },
-  }
+  } as const
 }
 
 function defineKnowledgeRead(service: KnowledgeService) {
@@ -99,7 +102,7 @@ function defineKnowledgeRead(service: KnowledgeService) {
         text: JSON.stringify(value, null, 2),
       }],
     },
-    async execute(args: { sourceId: string; path: string }) {
+    async execute(args: { sourceId: string; path: string }): Promise<ToolJson> {
       const result = await service.readSource(args.sourceId, args.path)
       if (!result.ok) {
         return { ok: false, code: result.code, message: result.message }
@@ -115,5 +118,66 @@ function defineKnowledgeRead(service: KnowledgeService) {
         content: result.content,
       }
     },
-  }
+  } as const
+}
+
+function defineKnowledgePropose(service: KnowledgeService) {
+  return {
+    name: 'knowledge_propose',
+    description: 'Submit a create, append, or update proposal to the dsh-obsidian ' +
+      'knowledge inbox for human review. This only creates a pending draft; it ' +
+      'never writes or modifies the source file. The user must review and apply it.',
+    parameters: {
+      kind: {
+        type: 'string',
+        required: true,
+        enum: ['create', 'append', 'update'],
+        description: 'Proposal operation: create a note, append text, or propose a replacement.',
+      },
+      title: {
+        type: 'string',
+        required: true,
+        description: 'Short human-readable proposal title (1–120 characters).',
+      },
+      sourceId: {
+        type: 'string',
+        required: true,
+        description: 'Configured knowledge source id, usually from knowledge_search.',
+      },
+      targetPath: {
+        type: 'string',
+        required: true,
+        description: 'Target path relative to the configured source root, e.g. notes/foo.md.',
+      },
+      body: {
+        type: 'string',
+        required: true,
+        description: 'Proposed Markdown content (1–200000 characters).',
+      },
+    },
+    output: {
+      schema: { type: 'json' as const },
+      render: (_args: unknown, value: unknown) => [{
+        type: 'text' as const,
+        text: JSON.stringify(value, null, 2),
+      }],
+    },
+    async execute(args: ProposeInput): Promise<ToolJson> {
+      const parsed = ProposeInputSchema.safeParse(args)
+      if (!parsed.success) return { ok: false, code: 'INVALID', message: 'invalid proposal input' }
+      const result = await service.propose(parsed.data.sourceId, parsed.data)
+      if (!result.ok) {
+        return { ok: false, code: result.code, message: result.message }
+      }
+      return {
+        ok: true,
+        itemId: result.item.id,
+        title: result.item.title,
+        kind: result.item.kind,
+        sourceId: result.item.sourceId,
+        targetPath: result.item.targetPath,
+        status: result.item.status,
+      }
+    },
+  } as const
 }

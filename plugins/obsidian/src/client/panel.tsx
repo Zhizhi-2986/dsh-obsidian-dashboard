@@ -1,18 +1,15 @@
 /** Knowledge main panel: full-text search, document open, proposal inbox. */
 
-import { useEffect, useMemo, useState, useSyncExternalStore, type ReactElement } from 'react'
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, useRef, type ReactElement } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { ISessions, SessionListState } from '@deepseek-ai/dsh-api-session-controller/client'
-import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
-import type { KnowledgeSourceInfo } from '../shared/rpc-contract.ts'
-import type { InboxItem } from '../shared/rpc-contract.ts'
+import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SourceKind } from '../shared/rpc-contract.ts'
 import type { KnowledgeRpc } from './remote.ts'
-import { sessionFileAddress } from './resource-address.ts'
+import { pickDirectory } from './directory-picker.ts'
 import { NS, type KnowledgeKey } from './locales.ts'
 import { zhCN, enUS } from './locales.ts'
 
-const PANEL_TABS = ['search', 'inbox'] as const
+const PANEL_TABS = ['search', 'browse', 'sources', 'preview', 'inbox'] as const
 type PanelTab = (typeof PANEL_TABS)[number]
 
 const s = {
@@ -41,6 +38,15 @@ const s = {
   empty: { color: 'rgba(127,127,127,0.7)', padding: '24px 8px', textAlign: 'center' as const, fontSize: 12 },
   row: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, marginBottom: 6, border: '1px solid rgba(127,127,127,0.14)', background: 'rgba(127,127,127,0.06)' },
   badge: (tone: string) => ({ fontSize: 10, padding: '1px 7px', borderRadius: 9, background: tone, color: '#0d0f12', fontWeight: 600 }),
+  browseToolbar: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.14)' },
+  breadcrumb: { display: 'flex', alignItems: 'center', gap: 4, padding: '6px 12px', color: 'rgba(127,127,127,0.8)', fontSize: 11, overflowX: 'auto' as const },
+  folderButton: { width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', marginBottom: 5, borderRadius: 7, border: '1px solid rgba(127,127,127,0.14)', background: 'rgba(127,127,127,0.05)', color: 'inherit', textAlign: 'left' as const, cursor: 'pointer' },
+  sourceForm: { display: 'flex', flexDirection: 'column' as const, gap: 10, maxWidth: 720, margin: '12px auto', padding: 16, borderRadius: 10, border: '1px solid rgba(127,127,127,0.2)', background: 'rgba(127,127,127,0.04)' },
+  sourceRow: { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: '1px solid rgba(127,127,127,0.12)' },
+  sourceLabel: { display: 'flex', flexDirection: 'column' as const, gap: 4, fontSize: 12, color: 'rgba(127,127,127,0.85)' },
+  sourceInput: { padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
+  previewToolbar: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.14)' },
+  previewContent: { margin: 0, padding: 16, whiteSpace: 'pre-wrap' as const, overflowWrap: 'anywhere' as const, lineHeight: 1.65, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 },
   footer: { padding: '7px 12px', borderTop: '1px solid rgba(127,127,127,0.18)', color: 'rgba(127,127,127,0.75)', fontSize: 11, display: 'flex', gap: 12, flexWrap: 'wrap' as const },
 }
 
@@ -62,15 +68,6 @@ export function knowledgeT(active: string) {
   }
 }
 
-/** Posix-relative path of `abs` under `cwd`, or null when outside. */
-function relativeToCwd(cwd: string, abs: string): string | null {
-  const c = cwd.replace(/\\/gu, '/').replace(/\/+$/u, '')
-  const a = abs.replace(/\\/gu, '/')
-  if (a === c) return ''
-  if (a.startsWith(`${c}/`)) return a.slice(c.length + 1)
-  return null
-}
-
 /** The sidebar panel icon; the sidebar owns the button and selected state. */
 export function KnowledgeIcon({ size }: PropsRuntime<'sidebar.panellist'>): ReactElement {
   return (
@@ -86,65 +83,208 @@ export interface KnowledgePanelViewProps {
   readonly rpc: KnowledgeRpc
 }
 
-/** Session context accessor resolved lazily at open time. */
-export type SessionAccessor = () => { sessionId?: string; cwd?: string }
-
 function hitTone(kind: InboxItem['kind']): string { return KIND_TONE[kind] }
 function statusTone(status: InboxItem['status']): string { return STATUS_TONE[status] }
 
 export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): ReactElement {
   const active = useLocale(ctx)
   const t = useMemo(() => knowledgeT(active), [active])
-  // `@deepseek-ai/dsh-session` and `dsh-api-session-controller` both declare
-  // `Context.sessions` (lib-level conflict hidden by skipLibCheck); narrow to
-  // the controller face we use.
-  const sessionsList: ObservableSnapshot<SessionListState> = (ctx.sessions as unknown as ISessions).list
-  const sessions = useSyncExternalStore(
-    (listener) => sessionsList.subscribe(listener),
-    () => sessionsList.getSnapshot(),
-  )
   const [tab, setTab] = useState<PanelTab>('search')
   const [query, setQuery] = useState('')
   const [sourceId, setSourceId] = useState<string>('')
+  const [browseSourceId, setBrowseSourceId] = useState<string>('')
+  const [browsePath, setBrowsePath] = useState('')
+  const [browseResult, setBrowseResult] = useState<BrowseOk | null>(null)
+  const [browseLoading, setBrowseLoading] = useState(false)
+  const [browseError, setBrowseError] = useState<string | null>(null)
+  const [previewDocument, setPreviewDocument] = useState<ReadDoc | null>(null)
+  const [previewReturnTab, setPreviewReturnTab] = useState<'search' | 'browse'>('search')
   const [sources, setSources] = useState<KnowledgeSourceInfo[]>([])
+  const [sourceError, setSourceError] = useState<string | null>(null)
+  const [newSourceName, setNewSourceName] = useState('')
+  const [newSourcePath, setNewSourcePath] = useState('')
+  const [newSourceKind, setNewSourceKind] = useState<SourceKind>('folder')
+  const [sourceSaving, setSourceSaving] = useState(false)
+  const [sourcePicking, setSourcePicking] = useState(false)
+  const [sourceFormError, setSourceFormError] = useState<string | null>(null)
   const [hits, setHits] = useState<{ sourceId: string; path: string; title: string; tags: string[]; snippet: string | null }[]>([])
   const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+  const [openError, setOpenError] = useState<string | null>(null)
   const [items, setItems] = useState<InboxItem[]>([])
+  const [inboxError, setInboxError] = useState<string | null>(null)
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set())
+  const sourceRefreshSequence = useRef(0)
+  const browseSelection = browseSourceId || sources[0]?.id || ''
+  const selectedBrowseSource = sources.find((source) => source.id === browseSelection)
 
-  const refreshSources = () => {
-    void rpc.listSources().then((result) => {
-      if (result.ok) setSources(result.sources)
-    })
+  const refreshSources = useCallback(async (): Promise<void> => {
+    const requestId = ++sourceRefreshSequence.current
+    try {
+      const result = await rpc.listSources()
+      if (requestId !== sourceRefreshSequence.current) return
+      if (result.ok) {
+        setSources(result.sources)
+        setSourceError(null)
+      } else {
+        setSourceError(result.message)
+      }
+    } catch (error) {
+      if (requestId === sourceRefreshSequence.current) {
+        setSourceError(error instanceof Error ? error.message : String(error))
+      }
+    }
+  }, [rpc])
+
+  const chooseSourceDirectory = async (): Promise<void> => {
+    setSourcePicking(true)
+    setSourceFormError(null)
+    try {
+      const desktop = (globalThis as typeof globalThis & {
+        __DSH_DIRECTORY_PICKER__?: { pick(): Promise<string | null> }
+      }).__DSH_DIRECTORY_PICKER__
+      const workspace = desktop ? undefined : (ctx as unknown as {
+        get(name: string): { pickDirectory(): Promise<string | null> } | undefined
+      }).get('uiWorkspace')
+      const selected = await pickDirectory(desktop, workspace)
+      if (selected !== null) {
+        setNewSourcePath(selected)
+        const folderName = selected.replace(/\\/gu, '/').replace(/\/+$/u, '').split('/').pop()
+        if (folderName) setNewSourceName((previous) => previous.trim() === '' ? folderName : previous)
+      }
+    } catch {
+      setSourceFormError(t('settingsPickerFailed'))
+    } finally {
+      setSourcePicking(false)
+    }
   }
 
+  const addSource = async (): Promise<void> => {
+    setSourceFormError(null)
+    setSourceSaving(true)
+    try {
+      const result = await rpc.addSource({ name: newSourceName, path: newSourcePath, kind: newSourceKind })
+      if (!result.ok) {
+        setSourceFormError(result.message)
+        return
+      }
+      setNewSourceName('')
+      setNewSourcePath('')
+      setBrowsePath('')
+      setBrowseSourceId(result.source.id)
+      await refreshSources()
+      setTab('browse')
+    } catch (error) {
+      setSourceFormError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSourceSaving(false)
+    }
+  }
+
+  const removeSource = async (source: KnowledgeSourceInfo): Promise<void> => {
+    setSourceFormError(null)
+    setBusyIds((prev) => new Set(prev).add(source.id))
+    try {
+      const result = await rpc.removeSource(source.id)
+      if (result.ok) {
+        sourceRefreshSequence.current += 1
+        setSources((prev) => prev.filter((entry) => entry.id !== source.id))
+        if (browseSourceId === source.id) {
+          setBrowseSourceId('')
+          setBrowsePath('')
+        }
+      } else {
+        setSourceFormError(result.message)
+      }
+    } catch (error) {
+      setSourceFormError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusyIds((prev) => { const next = new Set(prev); next.delete(source.id); return next })
+    }
+  }
+
+  const needsSourceRefresh = sources.some((source) => source.indexedAt === null && source.lastError === null)
+
   useEffect(() => {
-    refreshSources()
+    if (tab === 'inbox') return
+    void refreshSources()
+  }, [refreshSources, tab])
+
+  useEffect(() => {
+    if (!needsSourceRefresh) return
+    const timer = setInterval(() => { void refreshSources() }, 750)
+    return () => clearInterval(timer)
+  }, [refreshSources, needsSourceRefresh])
+
+  useEffect(() => {
     void rpc.listInbox().then((result) => {
-      if (result.ok) setItems([...result.items].reverse())
+      if (result.ok) {
+        setItems([...result.items].reverse())
+        setInboxError(null)
+      } else {
+        setInboxError(result.message)
+      }
+    }).catch((error) => setInboxError(error instanceof Error ? error.message : String(error)))
+  }, [rpc])
+
+  useEffect(() => {
+    if (tab !== 'browse' || browseSelection === '') {
+      setBrowseResult(null)
+      setBrowseError(null)
+      setBrowseLoading(false)
+      return
+    }
+    if (selectedBrowseSource?.indexedAt === null && selectedBrowseSource.lastError === null) {
+      setBrowseResult(null)
+      setBrowseError(null)
+      setBrowseLoading(true)
+      return
+    }
+    let cancelled = false
+    setBrowseLoading(true)
+    setBrowseError(null)
+    setBrowseResult(null)
+    void rpc.browse(browseSelection, browsePath).then((result) => {
+      if (cancelled) return
+      if (result.ok) setBrowseResult(result)
+      else setBrowseError(result.message)
+    }).catch((error) => {
+      if (!cancelled) setBrowseError(error instanceof Error ? error.message : String(error))
+    }).finally(() => {
+      if (!cancelled) setBrowseLoading(false)
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    return () => { cancelled = true }
+  }, [tab, browseSelection, browsePath, selectedBrowseSource?.indexedAt, selectedBrowseSource?.lastError, rpc])
 
-  const uiKey = ctx.get('uiSession')?.adapter.current.getSnapshot().key
-  const sessionId = typeof uiKey === 'string' ? uiKey : undefined
-  const summary = sessionId ? sessions.byId[sessionId as keyof typeof sessions.byId] : undefined
-
-  const openDocument = (source: KnowledgeSourceInfo, relPath: string) => {
-    const cwd = summary?.cwd
-    if (!sessionId || !cwd || !source.path) return
-    const relative = relativeToCwd(cwd, `${source.path.replace(/\\/gu, '/')}/${relPath}`)
-    if (relative === null) return
-    ctx.sidebarRight.openResource(sessionFileAddress(sessionId, relative))
+  const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string): Promise<void> => {
+    setOpenError(null)
+    try {
+      const result = await rpc.read(source.id, relPath)
+      if (result.ok) {
+        setPreviewReturnTab(tab === 'browse' ? 'browse' : 'search')
+        setPreviewDocument(result)
+        setTab('preview')
+      } else {
+        setOpenError(result.message)
+      }
+    } catch (error) {
+      setOpenError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   const runSearch = (searchQuery = query, searchSource = sourceId) => {
     const trimmed = searchQuery.trim()
+    setSearchError(null)
     if (trimmed === '') { setHits([]); return }
     setSearching(true)
-    void rpc.search(trimmed, { sourceId: searchSource || undefined, field: 'body', limit: 30 })
+    void rpc.search(trimmed, { sourceId: searchSource || undefined, field: 'all', limit: 30 })
       .then((result) => {
-        setHits(result.ok ? result.hits : [])
+        if (result.ok) setHits(result.hits)
+        else { setHits([]); setSearchError(result.message) }
+      })
+      .catch((error) => {
+        setHits([])
+        setSearchError(error instanceof Error ? error.message : String(error))
       })
       .finally(() => setSearching(false))
   }
@@ -181,6 +321,9 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
         <span style={{ fontWeight: 600, fontSize: 13 }}>{t('panelLabel')}</span>
         <div style={{ flex: 1 }} />
         <button style={s.tab(tab === 'search')} onClick={() => setTab('search')}>{t('searchResults')}</button>
+        <button style={s.tab(tab === 'browse')} onClick={() => setTab('browse')}>{t('browseLabel')}</button>
+        {previewDocument ? <button style={s.tab(tab === 'preview')} onClick={() => setTab('preview')}>{t('previewLabel')}</button> : null}
+        <button style={s.tab(tab === 'sources')} onClick={() => setTab('sources')}>{t('sourcesLabel')}</button>
         <button style={s.tab(tab === 'inbox')} onClick={() => setTab('inbox')}>
           {t('inboxLabel')}{pendingCount > 0 ? ` (${pendingCount})` : ''}
         </button>
@@ -207,15 +350,18 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
             </button>
           </div>
           <div style={s.body}>
-            {hits.length === 0 ? (
-              <div style={s.empty}>{t('searchEmpty')}</div>
+            {sourceError ? <div style={s.empty} role="alert">{sourceError}</div> : null}
+            {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
+            {searchError ? <div style={s.empty} role="alert">{t('searchFailed')}: {searchError}</div> : null}
+            {hits.length === 0 && !searchError ? (
+              <div style={s.empty}>{query.trim() === '' ? t('searchIdle') : t('searchEmpty')}</div>
             ) : hits.map((hit) => {
               const source = sources.find((entry) => entry.id === hit.sourceId)
               return (
                 <div key={`${hit.sourceId}/${hit.path}`} style={s.hit}>
                   <div style={s.hitTitle}>
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{hit.title}</span>
-                    {source ? <button style={s.button()} onClick={() => void rpc.read(hit.sourceId, hit.path).then((result) => { if (result.ok && source) openDocument(source, result.path) })}>{t('openFile')}</button> : null}
+                    {source ? <button style={s.button()} onClick={() => void readAndPreviewDocument(source, hit.path)}>{t('openFile')}</button> : null}
                   </div>
                   <div style={s.hitMeta}>{hit.sourceId} · {hit.path}</div>
                   {hit.snippet ? <div style={s.hitSnippet}>{hit.snippet}</div> : null}
@@ -227,8 +373,140 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
             })}
           </div>
         </>
+      ) : tab === 'preview' ? (
+        <>
+          <div style={s.previewToolbar}>
+            <button style={s.button()} onClick={() => setTab(previewReturnTab)}>{t('previewBack')}</button>
+            {previewDocument ? (
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 600 }}>{previewDocument.title}</div>
+                <div style={s.hitMeta}>{previewDocument.sourceId} · {previewDocument.path}</div>
+              </div>
+            ) : null}
+          </div>
+          {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
+          {previewDocument?.tags.length ? (
+            <div style={s.tags}>{previewDocument.tags.map((tag) => <span key={tag} style={s.tag}>#{tag}</span>)}</div>
+          ) : null}
+          <div style={{ ...s.body, padding: 0 }}>
+            {previewDocument ? <pre style={s.previewContent}>{previewDocument.content}</pre> : null}
+          </div>
+        </>
+      ) : tab === 'browse' ? (
+        <>
+          <div style={s.browseToolbar}>
+            <select
+              style={s.select}
+              value={browseSelection}
+              onChange={(event) => { setBrowseSourceId(event.target.value); setBrowsePath('') }}
+            >
+              <option value="">{t('browseSelectSource')}</option>
+              {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+            </select>
+            {browseResult ? <span style={s.hitMeta}>{browseResult.documents.length} · {browseResult.directoryPath || '/'}</span> : null}
+          </div>
+          {browseResult ? (
+            <div style={s.breadcrumb}>
+              <button style={s.button()} onClick={() => setBrowsePath('')}>{sources.find((source) => source.id === browseSelection)?.name ?? t('browseLabel')}</button>
+              {browseResult.directoryPath.split('/').filter(Boolean).map((segment, index, segments) => (
+                <span key={`${index}/${segment}`} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span>/</span>
+                  <button style={s.button()} onClick={() => setBrowsePath(segments.slice(0, index + 1).join('/'))}>{segment}</button>
+                </span>
+              ))}
+            </div>
+          ) : null}
+          <div style={s.body}>
+            {sourceError ? <div style={s.empty} role="alert">{sourceError}</div> : null}
+            {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
+            {selectedBrowseSource?.lastError ? <div style={s.empty} role="alert">{selectedBrowseSource.lastError}</div> : null}
+            {browseError ? <div style={s.empty} role="alert">{t('browseFailed')}: {browseError}</div> : null}
+            {!browseSelection ? (
+              <div style={s.empty}>
+                {t('browseSelectSource')}
+                <div style={{ marginTop: 10 }}>
+                  <button style={s.button('primary')} onClick={() => setTab('sources')}>{t('settingsSourceAdd')}</button>
+                </div>
+              </div>
+            ) : null}
+            {browseSelection && browseLoading && browseResult === null ? <div style={s.empty}>{t('browseLoading')}</div> : null}
+            {browseSelection && !browseLoading && browseResult && browseResult.directories.length === 0 && browseResult.documents.length === 0 ? (
+              <div style={s.empty}>{t('browseEmpty')}</div>
+            ) : null}
+            {browseResult ? (
+              <>
+                {browseResult.directoryPath !== '' ? (
+                  <button style={{ ...s.folderButton, fontSize: 12 }} onClick={() => setBrowsePath(browseResult.directoryPath.split('/').slice(0, -1).join('/'))}>
+                    <span aria-hidden>↰</span><span>{t('browseUp')}</span>
+                  </button>
+                ) : null}
+                {browseResult.directories.map((directory) => (
+                  <button key={`dir:${directory}`} style={s.folderButton} onClick={() => setBrowsePath(browsePath === '' ? directory : `${browsePath}/${directory}`)}>
+                    <span aria-hidden>▸</span><span style={{ flex: 1 }}>{directory}</span><span style={s.hitMeta}>/</span>
+                  </button>
+                ))}
+                {browseResult.documents.map((document) => {
+                  const source = sources.find((entry) => entry.id === document.sourceId)
+                  const canOpen = source !== undefined
+                  return (
+                    <div key={`doc:${document.path}`} style={s.row}>
+                      <span aria-hidden>▤</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{document.title}</div>
+                        <div style={s.hitMeta}>{document.path}</div>
+                      </div>
+                      {canOpen && source ? <button style={s.button()} onClick={() => void readAndPreviewDocument(source, document.path)}>{t('openFile')}</button> : null}
+                    </div>
+                  )
+                })}
+              </>
+            ) : null}
+          </div>
+        </>
+      ) : tab === 'sources' ? (
+        <div style={s.body}>
+          <div style={{ maxWidth: 760, margin: '0 auto' }}>
+            {sourceError ? <div style={s.empty} role="alert">{sourceError}</div> : null}
+            {sources.length === 0 ? <div style={s.empty}>{t('sourcesEmpty')}</div> : sources.map((source) => (
+              <div key={source.id} style={s.sourceRow}>
+                <span style={s.badge(source.kind === 'vault' ? '#8fd08a' : '#8fb4d0')}>{source.kind === 'vault' ? t('settingsSourceKindVault') : t('settingsSourceKindFolder')}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600 }}>{source.name}</div>
+                  <div style={{ ...s.hitMeta, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.path}</div>
+                  <div style={s.hitMeta}>{source.lastError ?? (source.indexedAt === null ? t('sourceReindexing') : `${source.fileCount} · ${new Date(source.indexedAt).toLocaleString()}`)}</div>
+                </div>
+                <button style={s.button('danger')} disabled={busyIds.has(source.id)} onClick={() => void removeSource(source)}>{t('settingsSourceRemove')}</button>
+              </div>
+            ))}
+            <div style={s.sourceForm}>
+              <div style={{ fontWeight: 600, fontSize: 14 }}>{t('settingsSourceAdd')}</div>
+              <label style={s.sourceLabel}>
+                {t('settingsSourceName')}
+                <input style={s.sourceInput} value={newSourceName} onChange={(event) => setNewSourceName(event.target.value)} maxLength={64} />
+              </label>
+              <label style={s.sourceLabel}>
+                {t('settingsSourcePath')}
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input style={{ ...s.sourceInput, flex: 1, minWidth: 0 }} value={newSourcePath} onChange={(event) => setNewSourcePath(event.target.value)} placeholder="/absolute/path/to/vault" />
+                  <button type="button" style={s.button()} disabled={sourcePicking || sourceSaving} onClick={() => void chooseSourceDirectory()}>{t('settingsPickDirectory')}</button>
+                </div>
+              </label>
+              <label style={s.sourceLabel}>
+                {t('settingsSourceKind')}
+                <select style={s.select} value={newSourceKind} onChange={(event) => setNewSourceKind(event.target.value as SourceKind)}>
+                  <option value="folder">{t('settingsSourceKindFolder')}</option>
+                  <option value="vault">{t('settingsSourceKindVault')}</option>
+                </select>
+              </label>
+              {sourceFormError ? <div style={{ ...s.hitMeta, color: 'rgba(210,90,70,0.95)' }} role="alert">{sourceFormError}</div> : null}
+              <div style={s.hitMeta}>{t('settingsPathHint')}</div>
+              <div><button style={s.button('primary')} disabled={sourceSaving || newSourceName.trim() === '' || newSourcePath.trim() === ''} onClick={() => void addSource()}>{sourceSaving ? '…' : t('settingsSourceAdd')}</button></div>
+            </div>
+          </div>
+        </div>
       ) : (
         <div style={s.body}>
+          {inboxError ? <div style={s.empty} role="alert">{inboxError}</div> : null}
           {items.length === 0 ? (
             <div style={s.empty}>{t('inboxEmpty')}</div>
           ) : items.map((item) => (

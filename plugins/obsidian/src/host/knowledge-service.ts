@@ -1,24 +1,24 @@
 /** Host Knowledge RPC — TypertRemoteService for the dsh-obsidian client half.
  *
- * Every @Remote method receives the Typert `workspaceFileScope` lookup
- * parameter (session → { sessionId, workspaceRoot }), following workspace-files.
- * Reads are unconfined by the sandbox (vaults may live outside the session
- * workspace); **all writes go through `ctx.fs` version-guarded intents** so
- * the sandbox and stale-version checks apply to every proposal application.
+ * Knowledge data is profile-scoped rather than bound to one conversation.
+ * Remote reads therefore do not require a `workspaceFileScope`; all source
+ * writes still go through `ctx.fs` version-guarded intents so the sandbox and
+ * stale-version checks apply to every proposal application.
  * The scope-free internals (`searchSources`, `readSource`, ...) are shared
  * with the Agent tools, which have no Session scope.
  */
 
 import * as path from 'node:path'
+import { constants as fsConstants, promises as fs } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { FsVersion, type FsTarget } from '@deepseek-ai/dsh-fs'
-import type { WorkspaceFileScope } from '@deepseek-ai/dsh-api-workspace-files'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import type { ObsidianSettings } from '../shared/settings-contract.ts'
+import { MAX_SOURCES, type ObsidianSettings } from '../shared/settings-contract.ts'
 import {
   KNOWLEDGE_SERVICE, fail, isFailResult, MAX_INBOX_ITEMS,
-  type AddSourceOk, type ApplyOk, type FailResult, type InboxItem,
+  type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type FailResult, type InboxItem,
   type KnowledgeResult, type KnowledgeSourceInfo, type ListSourcesOk,
   type ProposeInput, type ReadDoc, type SearchOk, type SearchOptions,
   type SourceKind,
@@ -28,6 +28,7 @@ import { KnowledgeSourceRuntime } from './knowledge-source.ts'
 import { digestNote } from './markdown.ts'
 import { fileStemOf } from './scanner.ts'
 import { InboxStore } from './inbox-store.ts'
+import { KnowledgeSourceStore } from './source-store.ts'
 import { normalizeSourceRelPath, resolveContainedPath } from './source-path.ts'
 
 const DEFAULT_SEARCH_LIMIT = 20
@@ -67,38 +68,78 @@ function targetIsCanonical(target: FsTarget, expectedPath: string): boolean {
   return String(target.targetKey) === expectedPath
 }
 
+function assertUniqueSourceIds(config: ObsidianSettings): void {
+  const sourceIds = config.knowledgeSources.map((source) => source.id)
+  if (new Set(sourceIds).size !== sourceIds.length) {
+    throw new Error('duplicate knowledge source ids in configuration')
+  }
+}
+
+function sameSourceIndexingConfig(left: ObsidianSettings['knowledgeSources'][number], right: ObsidianSettings['knowledgeSources'][number]): boolean {
+  return left.path === right.path && left.kind === right.kind &&
+    sameStrings(left.include, right.include) && sameStrings(left.exclude, right.exclude)
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
 export class KnowledgeService extends TypertRemoteService {
   /** Public because Cordis proxies forward service reads/writes through it. */
   context: Context
-  readonly #config: ObsidianSettings
+  #config: ObsidianSettings
   readonly #index: KnowledgeIndex
   readonly #runtimes = new Map<string, KnowledgeSourceRuntime>()
   readonly #inboxStore: InboxStore
+  readonly #sourceStore: KnowledgeSourceStore
+  readonly #ready: Promise<void>
+  #settingsUpdates: Promise<void> = Promise.resolve()
+  #shuttingDown = false
 
   constructor(ctx: Context, config: ObsidianSettings, dataDir: string) {
-    const sourceIds = config.knowledgeSources.map((source) => source.id)
-    if (new Set(sourceIds).size !== sourceIds.length) {
-      throw new Error('duplicate knowledge source ids in configuration')
-    }
+    assertUniqueSourceIds(config)
     super(ctx, KNOWLEDGE_SERVICE)
     this.context = ctx
-    this.#config = config
+    this.#config = { ...config, knowledgeSources: [] }
     this.#index = KnowledgeIndex.open(path.join(dataDir, 'knowledge.db'))
     this.#inboxStore = new InboxStore(dataDir)
-    for (const source of config.knowledgeSources) {
-      const runtime = new KnowledgeSourceRuntime(source, this.#index)
-      this.#runtimes.set(source.id, runtime)
-      // Kick off initial sync; watcher starts after the first pass completes.
-      void runtime.sync().catch(() => undefined).finally(() => runtime.startWatch())
-    }
+    this.#sourceStore = new KnowledgeSourceStore(dataDir)
+    this.#ready = this.#sourceStore.load(config.knowledgeSources).then(async (sources) => {
+      assertUniqueSourceIds({ ...config, knowledgeSources: sources })
+      await this.#applySettings({ ...config, knowledgeSources: sources })
+    })
+    this.listSources = this.listSources.bind(this)
+    this.addSource = this.addSource.bind(this)
+    this.removeSource = this.removeSource.bind(this)
+    this.browse = this.browse.bind(this)
+    this.indexSource = this.indexSource.bind(this)
+    this.search = this.search.bind(this)
+    this.read = this.read.bind(this)
+    this.proposeInbox = this.proposeInbox.bind(this)
+    this.listInbox = this.listInbox.bind(this)
+    this.applyInbox = this.applyInbox.bind(this)
+    this.dismissInbox = this.dismissInbox.bind(this)
+  }
+
+  /** Keep non-source plugin preferences live; knowledge sources belong to the page store. */
+  updateSettings(config: ObsidianSettings): Promise<void> {
+    if (this.#shuttingDown) return Promise.resolve()
+    return this.#queueSettingsChange(async () => {
+      await this.#ready
+      await this.#applySettings({ ...config, knowledgeSources: this.#config.knowledgeSources })
+    })
   }
 
   /** Hook invoked by the Host on runtime teardown (plugin reload/disable). */
-  shutdown(): void {
+  async shutdown(): Promise<void> {
+    if (this.#shuttingDown) return
+    this.#shuttingDown = true
+    await this.#ready.catch(() => undefined)
+    await this.#settingsUpdates.catch(() => undefined)
     const runtimes = [...this.#runtimes.values()]
     this.#runtimes.clear()
-    void Promise.all(runtimes.map((runtime) => runtime.stop()))
-      .then(() => this.#index.close())
+    await Promise.all(runtimes.map((runtime) => runtime.stop()))
+    this.#index.close()
   }
 
   // ── Scope-free internals (shared with Agent tools) ─────────────────────────
@@ -107,7 +148,67 @@ export class KnowledgeService extends TypertRemoteService {
     return this.#config.knowledgeSources.map((source) => this.#infoOf(source.id))
   }
 
+  async addKnowledgeSource(input: AddSourceInput, signal?: AbortSignal): Promise<KnowledgeResult<AddSourceOk>> {
+    signal?.throwIfAborted()
+    if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
+    const name = input.name.trim()
+    const requestedPath = input.path.trim()
+    if (name === '' || name.length > 64 || requestedPath === '' || requestedPath.length > 1024 || !path.isAbsolute(requestedPath)) {
+      return fail('INVALID', 'provide a source name and an absolute folder path')
+    }
+
+    let sourcePath: string
+    try {
+      const stat = await fs.stat(requestedPath)
+      if (!stat.isDirectory()) return fail('INVALID', 'knowledge source path must be a folder')
+      sourcePath = await fs.realpath(requestedPath)
+    } catch (error) {
+      return failure(error, fail('NOT_FOUND', 'knowledge source folder not found'))
+    }
+    signal?.throwIfAborted()
+
+    return this.#queueSettingsChange(async () => {
+      await this.#ready
+      signal?.throwIfAborted()
+      if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
+      const sources = this.#config.knowledgeSources
+      if (sources.length >= MAX_SOURCES) return fail('INVALID', `at most ${MAX_SOURCES} knowledge sources are allowed`)
+      if (sources.some((source) => path.resolve(source.path) === sourcePath)) {
+        return fail('ALREADY_EXISTS', 'this folder is already a knowledge source')
+      }
+      const source = {
+        id: randomUUID(), name, path: sourcePath, kind: input.kind, include: [], exclude: [],
+      } as const
+      const next = [...sources, source]
+      await this.#sourceStore.save(next)
+      await this.#applySettings({ ...this.#config, knowledgeSources: next })
+      return { ok: true, source: this.#infoOf(source.id) }
+    })
+  }
+
+  async removeKnowledgeSource(sourceId: string): Promise<KnowledgeResult<{ ok: true }>> {
+    if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
+    return this.#queueSettingsChange(async () => {
+      await this.#ready
+      if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
+      if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
+      const next = this.#config.knowledgeSources.filter((source) => source.id !== sourceId)
+      await this.#sourceStore.save(next)
+      await this.#applySettings({ ...this.#config, knowledgeSources: next })
+      return { ok: true }
+    })
+  }
+
+  browseSource(sourceId: string, directoryPath = ''): KnowledgeResult<BrowseOk> {
+    if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const relative = directoryPath === '' ? '' : normalizeSourceRelPath(directoryPath)
+    if (relative === null) return fail('INVALID', 'invalid or unsafe directory path')
+    const listing = this.#index.listDirectory(sourceId, relative)
+    return { ok: true, sourceId, directoryPath: relative, ...listing }
+  }
+
   async searchSources(query: string, options: SearchOptions): Promise<KnowledgeResult<SearchOk>> {
+    await this.#ready
     const trimmed = query.trim()
     if (trimmed === '' || trimmed.length > MAX_QUERY_CHARS) {
       return { ok: true, query: trimmed, hits: [], truncated: false }
@@ -122,23 +223,39 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   async readSource(sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadDoc>> {
+    await this.#ready
     const source = this.#sourceOf(sourceId)
     if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
     const relative = normalizeSourceRelPath(relPath)
     if (relative === null) return fail('INVALID', 'invalid or unsafe path')
     const absPath = await resolveContainedPath(source.path, relative)
     if (absPath === null) return fail('INVALID', 'path resolves outside the configured source')
-    const target = await this.context.fs.resolve(absPath)
-    if (!targetIsCanonical(target, absPath)) return fail('INVALID', 'target identity changed while resolving path')
-    const info = await this.context.fs.stat(target, signal)
-    if (info === undefined || info.type !== 'file') return fail('NOT_FOUND', 'file not found')
+    signal?.throwIfAborted()
+
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined
     let content: string
+    let version: string
     try {
-      content = await this.context.fs.readText(target, signal)
+      const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+      handle = await fs.open(absPath, fsConstants.O_RDONLY | noFollow)
+      const info = await handle.stat()
+      if (!info.isFile()) return fail('NOT_FOUND', 'file not found')
+      if (info.size > 4 * 1024 * 1024) return fail('TOO_LARGE', 'document is too large to review here')
+
+      const pathInfo = await fs.lstat(absPath)
+      const verifiedPath = await resolveContainedPath(source.path, relative)
+      if (pathInfo.isSymbolicLink() || pathInfo.dev !== info.dev || pathInfo.ino !== info.ino || verifiedPath !== absPath) {
+        return fail('INVALID', 'target identity changed while resolving path')
+      }
+      signal?.throwIfAborted()
+      content = await handle.readFile({ encoding: 'utf8', signal })
+      if (content.length > 4 * 1024 * 1024) return fail('TOO_LARGE', 'document is too large to review here')
+      version = `${info.dev}:${info.ino}:${info.mtimeMs}:${info.size}`
     } catch (error) {
       return failure(error, fail('IO', 'failed to read file'))
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
-    if (content.length > 4 * 1024 * 1024) return fail('TOO_LARGE', 'document is too large to review here')
     const digest = digestNote(content, fileStemOf(relative))
     const known = this.#index.knownPaths(sourceId)
     const indexed = this.#index.getDoc(sourceId, relative)
@@ -153,7 +270,7 @@ export class KnowledgeService extends TypertRemoteService {
       sourceId,
       path: relative,
       content,
-      version: String(info.version),
+      version,
       title: digest.title,
       tags: [...digest.tags],
       links,
@@ -163,6 +280,7 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   async propose(sourceId: string, input: ProposeInput, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    await this.#ready
     if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
     if (input.sourceId !== sourceId) return fail('INVALID', 'source mismatch')
     const relative = normalizeSourceRelPath(input.targetPath)
@@ -185,6 +303,7 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   async applyInboxItem(itemId: string, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
+    await this.#ready
     const items = await this.#inboxStore.list()
     const item = items.find((entry) => entry.id === itemId) ?? null
     if (item === null) return fail('NOT_FOUND', 'proposal not found')
@@ -238,15 +357,34 @@ export class KnowledgeService extends TypertRemoteService {
     return { ok: true }
   }
 
-  // ── Typert RPC surface (per-Session scope) ─────────────────────────────────
+  // ── Typert RPC surface (profile-scoped knowledge) ──────────────────────────
 
   @Remote
-  async listSources(_scope: WorkspaceFileScope): Promise<KnowledgeResult<ListSourcesOk>> {
+  async listSources(): Promise<KnowledgeResult<ListSourcesOk>> {
+    await this.#ready
+    await this.#settingsUpdates
     return { ok: true, sources: this.listSourceInfos() }
   }
 
   @Remote
-  async indexSource(_scope: WorkspaceFileScope, sourceId: string): Promise<KnowledgeResult<AddSourceOk>> {
+  async addSource(input: AddSourceInput, signal?: AbortSignal): Promise<KnowledgeResult<AddSourceOk>> {
+    return this.addKnowledgeSource(input, signal)
+  }
+
+  @Remote
+  async removeSource(sourceId: string): Promise<KnowledgeResult<{ ok: true }>> {
+    return this.removeKnowledgeSource(sourceId)
+  }
+
+  @Remote
+  async browse(sourceId: string, directoryPath: string): Promise<KnowledgeResult<BrowseOk>> {
+    await this.#ready
+    return this.browseSource(sourceId, directoryPath)
+  }
+
+  @Remote
+  async indexSource(sourceId: string): Promise<KnowledgeResult<AddSourceOk>> {
+    await this.#ready
     if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
     const runtime = this.#runtimes.get(sourceId)
     if (runtime === undefined) return fail('NOT_FOUND', 'unknown knowledge source')
@@ -259,36 +397,72 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   @Remote
-  async search(scope: WorkspaceFileScope, query: string, options: SearchOptions): Promise<KnowledgeResult<SearchOk>> {
+  async search(query: string, options: SearchOptions): Promise<KnowledgeResult<SearchOk>> {
     return this.searchSources(query, options)
   }
 
   @Remote
-  async read(scope: WorkspaceFileScope, sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadDoc>> {
+  async read(sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadDoc>> {
     return this.readSource(sourceId, relPath, signal)
   }
 
   @Remote
-  async proposeInbox(scope: WorkspaceFileScope, input: ProposeInput, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+  async proposeInbox(input: ProposeInput, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
     return this.propose(input.sourceId, input, signal)
   }
 
   @Remote
-  async listInbox(_scope: WorkspaceFileScope): Promise<KnowledgeResult<{ ok: true; items: InboxItem[] }>> {
+  async listInbox(): Promise<KnowledgeResult<{ ok: true; items: InboxItem[] }>> {
     return this.listInboxItems()
   }
 
   @Remote
-  async applyInbox(scope: WorkspaceFileScope, itemId: string, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
+  async applyInbox(itemId: string, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
     return this.applyInboxItem(itemId, signal)
   }
 
   @Remote
-  async dismissInbox(_scope: WorkspaceFileScope, itemId: string): Promise<KnowledgeResult<{ ok: true }>> {
+  async dismissInbox(itemId: string): Promise<KnowledgeResult<{ ok: true }>> {
     return this.dismissInboxItem(itemId)
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
+
+  #queueSettingsChange<T>(change: () => Promise<T>): Promise<T> {
+    const task = this.#settingsUpdates.then(change, change)
+    this.#settingsUpdates = task.then(() => undefined, () => undefined)
+    return task
+  }
+
+  #startRuntime(runtime: KnowledgeSourceRuntime): void {
+    void runtime.sync().catch(() => undefined).finally(() => runtime.startWatch())
+  }
+
+  async #applySettings(config: ObsidianSettings): Promise<void> {
+    assertUniqueSourceIds(config)
+    const previousById = new Map(this.#config.knowledgeSources.map((source) => [source.id, source]))
+    const nextById = new Map(config.knowledgeSources.map((source) => [source.id, source]))
+
+    for (const previous of this.#config.knowledgeSources) {
+      const next = nextById.get(previous.id)
+      if (next !== undefined && sameSourceIndexingConfig(previous, next) && this.#runtimes.has(previous.id)) continue
+      const runtime = this.#runtimes.get(previous.id)
+      if (runtime !== undefined) {
+        this.#runtimes.delete(previous.id)
+        await runtime.stop()
+      }
+      this.#index.clearSource(previous.id)
+    }
+
+    this.#config = config
+    for (const source of config.knowledgeSources) {
+      const previous = previousById.get(source.id)
+      if (previous !== undefined && sameSourceIndexingConfig(previous, source) && this.#runtimes.has(source.id)) continue
+      const runtime = new KnowledgeSourceRuntime(source, this.#index)
+      this.#runtimes.set(source.id, runtime)
+      this.#startRuntime(runtime)
+    }
+  }
 
   #sourceOf(sourceId: string): { id: string; name: string; path: string; kind: SourceKind } | null {
     return this.#config.knowledgeSources.find((source) => source.id === sourceId) ?? null

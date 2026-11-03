@@ -6,8 +6,10 @@
  * synchronous (`DatabaseSync`), matching the Host-half usage pattern.
  */
 
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { DocLink, SearchHit } from '../shared/rpc-contract.ts'
+import type { DocLink, DocumentRef, SearchHit } from '../shared/rpc-contract.ts'
 import type { ParsedLink } from './markdown.ts'
 
 export interface IndexedDoc {
@@ -29,6 +31,7 @@ export class KnowledgeIndex {
   }
 
   static open(file: string): KnowledgeIndex {
+    if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
     const db = new DatabaseSync(file)
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA synchronous = NORMAL')
@@ -104,6 +107,45 @@ export class KnowledgeIndex {
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
+    }
+  }
+
+  /** Immediate indexed folders and note files under one source-relative directory. */
+  listDirectory(sourceId: string, directoryPath: string): { directories: string[]; documents: DocumentRef[] } {
+    const normalizedDirectory = directoryPath.endsWith('/') ? directoryPath.slice(0, -1) : directoryPath
+    const prefix = normalizedDirectory === '' ? '' : `${normalizedDirectory}/`
+    const directoryRows = this.#db.prepare(`
+      SELECT DISTINCT substr(rest, 1, instr(rest, '/') - 1) AS name
+      FROM (
+        SELECT substr(rel_path, length(?) + 1) AS rest
+        FROM docs
+        WHERE source_id = ? AND substr(rel_path, 1, length(?)) = ?
+      )
+      WHERE instr(rest, '/') > 0
+      ORDER BY name
+    `).all(prefix, sourceId, prefix, prefix) as Array<{ name: string }>
+    const rows = this.#db.prepare(`
+      SELECT rel_path, title, tags, mtime_ms
+      FROM docs
+      WHERE source_id = ?
+        AND substr(rel_path, 1, length(?)) = ?
+        AND instr(substr(rel_path, length(?) + 1), '/') = 0
+      ORDER BY rel_path
+    `).all(sourceId, prefix, prefix, prefix) as Array<{
+      rel_path: string
+      title: string
+      tags: string
+      mtime_ms: number | null
+    }>
+    return {
+      directories: directoryRows.map((row) => row.name),
+      documents: rows.map((row) => ({
+        sourceId,
+        path: row.rel_path,
+        title: row.title,
+        tags: JSON.parse(row.tags) as string[],
+        updatedAt: row.mtime_ms,
+      })),
     }
   }
 

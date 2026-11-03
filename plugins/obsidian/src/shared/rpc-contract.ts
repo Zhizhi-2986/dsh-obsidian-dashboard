@@ -3,8 +3,8 @@
  * The Host serves this contract over the DSH Typert protocol
  * (`TypertRemoteService` + `@Remote`, see `src/host/knowledge-service.ts`);
  * the Client mounts the mirror face via `ctx.remote.$mount` (see
- * `src/client/remote.ts`). Every invocation carries the Typert
- * `workspaceFileScope` lookup parameter, resolved per Session by the host.
+ * `src/client/remote.ts`). Knowledge operations are profile-scoped and do not require a
+ * conversation Session lookup.
  *
  * Values crossing the wire use `{ ok: true, ... }` / `{ ok: false, code, message }`
  * envelopes with zod schemas on both sides (workspace-files convention).
@@ -94,6 +94,15 @@ export const DocumentRefSchema = z.object({
   updatedAt: z.number().nullable(),
 })
 export type DocumentRef = z.infer<typeof DocumentRefSchema>
+
+export const BrowseOkSchema = z.object({
+  ok: z.literal(true),
+  sourceId: z.string(),
+  directoryPath: z.string(),
+  directories: z.array(z.string()),
+  documents: z.array(DocumentRefSchema),
+})
+export type BrowseOk = z.infer<typeof BrowseOkSchema>
 
 export const SearchOptionsSchema = z.object({
   /** Restrict to one source. */

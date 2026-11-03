@@ -1,42 +1,4 @@
-/** Hand-written ambient types for @deepseek-ai/dsh-tools (no .d.ts shipped).
- *
- * Shapes match the installed runtime (dsh-tool-cordis registration pattern,
- * audit D Q1): `parameters` is a flat JSON-Schema property DSL, `output` is
- * `{ schema: { type: 'json' }, render(args, value) }`.
- *
- * No top-level import: this file stays a global script so the ambient
- * declaration creates the module.
+/** @deepseek-ai/dsh-tools@0.2.1-rc.5 ships the canonical client/host typings.
+ *  This file intentionally adds no ambient module declaration; keeping a local
+ *  shadow would erase defineTool's schema compiler from the type contract.
  */
-
-declare module '@deepseek-ai/dsh-tools' {
-  export interface ToolOutputRenderItem {
-    readonly type: 'text'
-    readonly text: string
-  }
-
-  export interface ToolOutputSpec {
-    readonly schema: { readonly type: 'json' }
-    readonly render?: (args: unknown, value: unknown) => readonly ToolOutputRenderItem[]
-  }
-
-  export interface ToolExecution {
-    readonly signal: AbortSignal
-  }
-
-  export interface ToolDefinition {
-    readonly name: string
-    readonly description: string
-    /** Flat JSON-Schema property DSL (audit D Q1). */
-    readonly parameters: Readonly<Record<string, {
-      readonly type?: string
-      readonly required?: boolean
-      readonly enum?: readonly unknown[]
-      readonly description?: string
-    }>>
-    readonly output: ToolOutputSpec
-    readonly execute?: (args: never, exec: ToolExecution) => unknown | Promise<unknown>
-    readonly presentCall?: (args: unknown) => unknown
-  }
-
-  export function defineTool(definition: ToolDefinition): ToolDefinition
-}

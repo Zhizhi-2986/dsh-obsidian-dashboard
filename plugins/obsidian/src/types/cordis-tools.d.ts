@@ -1,17 +1,4 @@
-/** Module augmentation: expose the tools registry on the Cordis Context.
- *
- * Kept in its own file with a top-level import so this is a *module
- * augmentation* of the real @deepseek-ai/cordis package (preserving its
- * exports), not a shadowing ambient declaration.
+/** ToolRuntime augments Cordis Context from @deepseek-ai/dsh-tools@0.2.1-rc.5.
+ *  No local augmentation is needed; this marker file prevents stale declarations
+ *  from shadowing the installed host contract.
  */
-
-import '@deepseek-ai/cordis'
-import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    tools: {
-      register(tool: ToolDefinition): void
-    }
-  }
-}

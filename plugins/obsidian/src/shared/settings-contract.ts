@@ -37,6 +37,7 @@ export interface InboxSettings {
 }
 
 export interface ObsidianSettings {
+  /** Legacy bootstrap only; the Knowledge page persists active sources in sources.json. */
   readonly knowledgeSources: readonly KnowledgeSourceConfig[]
   readonly inbox: InboxSettings
 }

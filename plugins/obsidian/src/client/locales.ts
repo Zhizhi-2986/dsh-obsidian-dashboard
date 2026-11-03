@@ -12,7 +12,17 @@ export type KnowledgeKey =
   | 'panelLabel'
   | 'searchPlaceholder'
   | 'searchEmpty'
+  | 'searchIdle'
+  | 'searchFailed'
   | 'searchResults'
+  | 'browseLabel'
+  | 'browseEmpty'
+  | 'browseSelectSource'
+  | 'browseLoading'
+  | 'browseUp'
+  | 'browseFailed'
+  | 'previewLabel'
+  | 'previewBack'
   | 'sourcesLabel'
   | 'sourcesEmpty'
   | 'sourceAdd'
@@ -43,6 +53,8 @@ export type KnowledgeKey =
   | 'settingsSourceAdd'
   | 'settingsNoSources'
   | 'settingsPickDirectory'
+  | 'settingsPickerFailed'
+  | 'settingsPathHint'
   | 'settingsInboxKeeDraft'
   | 'settingsInboxKeepDraftHint'
 
@@ -50,7 +62,17 @@ export const zhCN: Record<KnowledgeKey, string> = {
   panelLabel: '知识',
   searchPlaceholder: '搜索知识库…',
   searchEmpty: '没有匹配的笔记',
+  searchIdle: '输入关键词搜索，或切换到「浏览」查看笔记目录。',
+  searchFailed: '搜索失败',
   searchResults: '检索结果',
+  browseLabel: '浏览',
+  browseEmpty: '此目录下没有已索引的笔记或子目录',
+  browseSelectSource: '选择知识源进行浏览',
+  browseLoading: '正在读取目录…',
+  browseUp: '上级目录',
+  browseFailed: '读取目录失败',
+  previewLabel: '预览',
+  previewBack: '返回',
   sourcesLabel: '知识源',
   sourcesEmpty: '尚未配置知识源',
   sourceAdd: '添加知识源',
@@ -71,7 +93,7 @@ export const zhCN: Record<KnowledgeKey, string> = {
   linksLabel: '出链',
   backlinksLabel: '反链',
   settingsTitle: '知识工作台',
-  settingsDescription: '配置 Obsidian Vault 与知识目录、收件箱行为。',
+  settingsDescription: '知识源请在「知识」页面管理；此处仅配置收件箱行为。',
   settingsSourceName: '名称',
   settingsSourcePath: '路径',
   settingsSourceKind: '类型',
@@ -81,6 +103,8 @@ export const zhCN: Record<KnowledgeKey, string> = {
   settingsSourceAdd: '添加知识源',
   settingsNoSources: '暂无知识源',
   settingsPickDirectory: '选择目录…',
+  settingsPickerFailed: '无法打开目录选择器，请重试或手动输入完整路径。',
+  settingsPathHint: '请选择文件夹，或手动输入文件夹的完整路径。',
   settingsInboxKeeDraft: '写入冲突时保留草稿',
   settingsInboxKeepDraftHint: '目标文件在提案后被修改时，将提案标记为冲突而非静默失败。',
 }
@@ -89,7 +113,17 @@ export const enUS: Record<KnowledgeKey, string> = {
   panelLabel: 'Knowledge',
   searchPlaceholder: 'Search knowledge…',
   searchEmpty: 'No matching notes',
+  searchIdle: 'Enter a keyword to search, or switch to Browse to explore note folders.',
+  searchFailed: 'Search failed',
   searchResults: 'Results',
+  browseLabel: 'Browse',
+  browseEmpty: 'No indexed notes or subfolders here',
+  browseSelectSource: 'Choose a source to browse',
+  browseLoading: 'Loading folder…',
+  browseUp: 'Parent folder',
+  browseFailed: 'Could not read this folder',
+  previewLabel: 'Preview',
+  previewBack: 'Back',
   sourcesLabel: 'Knowledge sources',
   sourcesEmpty: 'No knowledge sources configured',
   sourceAdd: 'Add knowledge source',
@@ -110,7 +144,7 @@ export const enUS: Record<KnowledgeKey, string> = {
   linksLabel: 'Links',
   backlinksLabel: 'Backlinks',
   settingsTitle: 'Knowledge Workbench',
-  settingsDescription: 'Configure Obsidian vaults and knowledge folders, plus inbox behavior.',
+  settingsDescription: 'Manage knowledge sources in the Knowledge page; inbox behavior is configured here.',
   settingsSourceName: 'Name',
   settingsSourcePath: 'Path',
   settingsSourceKind: 'Kind',
@@ -119,7 +153,9 @@ export const enUS: Record<KnowledgeKey, string> = {
   settingsSourceRemove: 'Remove',
   settingsSourceAdd: 'Add source',
   settingsNoSources: 'No sources yet',
-  settingsPickDirectory: 'Pick directory…',
+  settingsPickDirectory: 'Choose folder…',
+  settingsPickerFailed: 'Could not open the folder chooser. Try again or enter the full path manually.',
+  settingsPathHint: 'Choose a folder or enter its full path manually.',
   settingsInboxKeeDraft: 'Keep draft on write conflict',
   settingsInboxKeepDraftHint: 'When the target changed after the proposal, mark the item conflicted instead of failing silently.',
 }
