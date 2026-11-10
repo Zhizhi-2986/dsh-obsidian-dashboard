@@ -5,8 +5,8 @@
 import { z } from 'zod'
 import type { TypertRemoteContribution } from '@deepseek-ai/dsh-typert-protocol'
 import {
-  KNOWLEDGE_SERVICE, PKG, FAIL_CODES, fail,
-  type FailResult, type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type InboxItem,
+  KNOWLEDGE_SERVICE, PKG, FAIL_CODES, InboxRevisionSchema, REBASE_OPERATIONS, fail,
+  type FailResult, type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type InboxItem, type RebaseOperation,
   type KnowledgeSourceInfo, type ListSourcesOk, type ReadDoc,
   type SearchOk, type SearchOptions,
 } from '../shared/rpc-contract.ts'
@@ -85,18 +85,23 @@ const ProposeInputSchema = z.object({
 const InboxItemSchema = z.object({
   id: Str,
   createdAt: z.number(),
+  revision: InboxRevisionSchema,
   kind: z.enum(['create', 'append', 'update']),
   title: Str,
   sourceId: Str,
   targetPath: Str,
+  agentId: Str.nullable(),
+  rebasedFrom: Str.nullable(),
   body: Str,
+  baselineContent: Str.max(4_194_304),
   status: z.enum(['pending', 'applied', 'dismissed', 'conflicted']),
   baseVersion: Str.nullable(),
   conflictMessage: Str.nullable(),
 })
+const RebaseOperationSchema = z.enum(REBASE_OPERATIONS)
 const ProposeOkSchema = z.object({ ok: z.literal(true), item: InboxItemSchema })
 const InboxListOkSchema = z.object({ ok: z.literal(true), items: z.array(InboxItemSchema) })
-const ApplyOkSchema = z.object({ ok: z.literal(true), itemId: Str, version: Str })
+const ApplyOkSchema = z.object({ ok: z.literal(true), itemId: Str, version: Str, statusError: Str.nullable(), syncError: Str.nullable() })
 const OkSchema = z.object({ ok: z.literal(true) })
 
 const ListSourcesResultSchema = z.union([ListSourcesOkSchema, FailResultSchema])
@@ -155,7 +160,9 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
     invocation('read', [strParam('sourceId', QualifiedName), strParam('relPath', RelPath)], resultCodec(ReadResultSchema, 'ReadResult'), true),
     invocation('proposeInbox', [typedParam('input', ProposeInputSchema, 'ProposeInput')], resultCodec(ProposeResultSchema, 'ProposeResult'), true),
     invocation('listInbox', [], resultCodec(InboxListResultSchema, 'InboxListResult')),
-    invocation('applyInbox', [strParam('itemId', QualifiedName)], resultCodec(ApplyResultSchema, 'ApplyResult'), true),
+    invocation('updateInboxDraft', [strParam('itemId', QualifiedName), strParam('body', Str.max(200_000))], resultCodec(ProposeResultSchema, 'ProposeResult')),
+    invocation('rebaseInbox', [strParam('itemId', QualifiedName), typedParam('operation', RebaseOperationSchema, 'RebaseOperation')], resultCodec(ProposeResultSchema, 'ProposeResult'), true),
+    invocation('applyInbox', [strParam('itemId', QualifiedName), typedParam('expectedRevision', InboxRevisionSchema, 'InboxRevision')], resultCodec(ApplyResultSchema, 'ApplyResult'), true),
     invocation('dismissInbox', [strParam('itemId', QualifiedName)], resultCodec(OkResultSchema, 'OkResult')),
   ],
 }
@@ -178,7 +185,9 @@ export interface KnowledgeRpc {
     body: string
   }): Promise<{ ok: true; item: InboxItem } | FailResult>
   listInbox(): Promise<{ ok: true; items: InboxItem[] } | FailResult>
-  applyInbox(itemId: string, signal?: AbortSignal): Promise<ApplyOk | FailResult>
+  updateInboxDraft(itemId: string, body: string): Promise<{ ok: true; item: InboxItem } | FailResult>
+  rebaseInbox(itemId: string, operation?: RebaseOperation, signal?: AbortSignal): Promise<{ ok: true; item: InboxItem } | FailResult>
+  applyInbox(itemId: string, expectedRevision: number, signal?: AbortSignal): Promise<ApplyOk | FailResult>
   dismissInbox(itemId: string): Promise<{ ok: true } | FailResult>
 }
 
@@ -216,7 +225,9 @@ export function knowledgeRpcOf(ctx: { readonly remote: unknown }): KnowledgeRpc 
     read: async (sourceId, relPath, signal) => await invoke<ReadDoc>('read', sourceId, relPath, signal),
     proposeInbox: async (input) => await invoke<{ ok: true; item: InboxItem }>('proposeInbox', input),
     listInbox: async () => await invoke<{ ok: true; items: InboxItem[] }>('listInbox'),
-    applyInbox: async (itemId, signal) => await invoke<ApplyOk>('applyInbox', itemId, signal),
+    updateInboxDraft: async (itemId, body) => await invoke<{ ok: true; item: InboxItem }>('updateInboxDraft', itemId, body),
+    rebaseInbox: async (itemId, operation, signal) => await invoke<{ ok: true; item: InboxItem }>('rebaseInbox', itemId, operation ?? 'same', signal),
+    applyInbox: async (itemId, expectedRevision, signal) => await invoke<ApplyOk>('applyInbox', itemId, expectedRevision, signal),
     dismissInbox: async (itemId) => await invoke<{ ok: true }>('dismissInbox', itemId),
   }
 }

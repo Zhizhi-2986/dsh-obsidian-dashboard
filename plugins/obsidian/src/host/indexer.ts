@@ -6,8 +6,9 @@
  * synchronous (`DatabaseSync`), matching the Host-half usage pattern.
  */
 
-import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { ensurePrivateDirectorySync, ensurePrivateFileSync } from './private-storage.ts'
 import { DatabaseSync } from 'node:sqlite'
 import type { DocLink, DocumentRef, SearchHit } from '../shared/rpc-contract.ts'
 import type { ParsedLink } from './markdown.ts'
@@ -31,7 +32,10 @@ export class KnowledgeIndex {
   }
 
   static open(file: string): KnowledgeIndex {
-    if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    if (file !== ':memory:') {
+      ensurePrivateDirectorySync(dirname(file))
+      ensurePrivateFileSync(file)
+    }
     const db = new DatabaseSync(file)
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA synchronous = NORMAL')
@@ -218,10 +222,14 @@ export class KnowledgeIndex {
 
     const column = field === 'title' ? 'title' : field === 'tags' ? 'tags' : 'body'
     const matchQuery = field === undefined || field === 'all' ? ftsQuery : `${column} : (${ftsQuery})`
+    const lineStart = `\uE000${randomUUID()}\uE001`
+    const lineEnd = `\uE002${randomUUID()}\uE003`
     let sql = `
+      WITH matching AS MATERIALIZED (
       SELECT d.source_id, d.rel_path, d.title, d.tags, d.mtime_ms,
              snippet(docs_fts, ${BODY_COLUMN_INDEX}, '⟦', '⟧', ' … ', 24) AS snippet,
-             NULL AS line
+             highlight(docs_fts, ${BODY_COLUMN_INDEX}, '${lineStart}', '${lineEnd}') AS marked_body,
+             rank AS score
       FROM docs_fts
       JOIN docs d ON d.source_id = docs_fts.source_id AND d.rel_path = docs_fts.rel_path
       WHERE docs_fts MATCH ?
@@ -231,7 +239,17 @@ export class KnowledgeIndex {
       sql += ' AND d.source_id = ?'
       params.push(sourceId)
     }
-    sql += ' ORDER BY rank LIMIT ?'
+    sql += `
+      )
+      SELECT source_id, rel_path, title, tags, mtime_ms, snippet,
+        CASE WHEN instr(marked_body, ?) = 0 THEN NULL ELSE
+          length(substr(marked_body, 1, instr(marked_body, ?) - 1)) -
+          length(replace(substr(marked_body, 1, instr(marked_body, ?) - 1), char(10), '')) + 1
+        END AS line
+      FROM matching
+    `
+    params.push(lineStart, lineStart, lineStart)
+    sql += ' ORDER BY score LIMIT ?'
     params.push(limit)
 
     const rows = this.#db.prepare(sql).all(...params) as Array<{

@@ -19,27 +19,28 @@ export const MAX_PROPOSAL_BODY_CHARS = 200_000
 /** Knowledge source kinds. `vault` = Obsidian-style vault (Wikilinks, tags,
  * frontmatter, attachments); `folder` = plain directory of documents. */
 
+export interface SourceRootIdentity {
+  readonly dev: string
+  readonly ino: string
+}
+
 export interface KnowledgeSourceConfig {
   /** Stable id used by the RPC and the index. Never a user-visible label. */
   readonly id: string
   readonly name: string
   readonly path: string
   readonly kind: KnowledgeSourceKind
+  /** Persistent local filesystem identity pinned when the source is registered. */
+  readonly rootIdentity?: SourceRootIdentity
   /** Include subpaths (relative to source root), empty = everything. */
   readonly include: readonly string[]
   /** Exclude subpaths (relative to source root). */
   readonly exclude: readonly string[]
 }
 
-export interface InboxSettings {
-  /** Versions: keep a proposal draft on conflict instead of failing silently. */
-  readonly keepDraftOnConflict: boolean
-}
-
 export interface ObsidianSettings {
   /** Legacy bootstrap only; the Knowledge page persists active sources in sources.json. */
   readonly knowledgeSources: readonly KnowledgeSourceConfig[]
-  readonly inbox: InboxSettings
 }
 
 const KnowledgeSource = z.object({
@@ -47,17 +48,15 @@ const KnowledgeSource = z.object({
   name: z.string().min(1).max(MAX_SOURCE_NAME_LENGTH),
   path: z.string().min(1).max(MAX_SOURCE_PATH_LENGTH),
   kind: z.union(SOURCE_KINDS),
+  rootIdentity: z.object({ dev: z.string().default(''), ino: z.string().default('') }).default({ dev: '', ino: '' }),
   include: z.array(z.string().max(256)).max(20).default([]),
   exclude: z.array(z.string().max(256)).max(20).default([]),
 })
 
 export const ObsidianConfig: ReturnType<typeof z.object> = z.object({
   knowledgeSources: z.array(KnowledgeSource).max(MAX_SOURCES).default([]).volatile(),
-  inbox: z.object({
-    keepDraftOnConflict: z.boolean().default(true),
-  }).default({ keepDraftOnConflict: true }).volatile(),
 })
 
 export function defaults(): ObsidianSettings {
-  return { knowledgeSources: [], inbox: { keepDraftOnConflict: true } }
+  return { knowledgeSources: [] }
 }

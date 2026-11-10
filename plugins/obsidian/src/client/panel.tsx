@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, useRef, type ReactElement } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SourceKind } from '../shared/rpc-contract.ts'
+import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SearchHit, SourceKind } from '../shared/rpc-contract.ts'
 import type { KnowledgeRpc } from './remote.ts'
+import { MarkdownView, slugHeading } from './markdown-view.tsx'
 import { pickDirectory } from './directory-picker.ts'
 import { NS, type KnowledgeKey } from './locales.ts'
 import { zhCN, enUS } from './locales.ts'
@@ -53,6 +54,43 @@ const s = {
 const KIND_TONE: Record<InboxItem['kind'], string> = { create: '#8fd08a', append: '#d0b98f', update: '#8fb4d0' }
 const STATUS_TONE: Record<InboxItem['status'], string> = { pending: '#d0c78f', applied: '#8fd08a', dismissed: 'rgba(127,127,127,0.3)', conflicted: '#d08f8f' }
 
+type DiffLine = { readonly kind: 'same' | 'added' | 'removed'; readonly text: string }
+
+function finalProposalContent(item: InboxItem, draft = item.body): string {
+  if (item.kind === 'append') return `${item.baselineContent.replace(/\s*$/u, '')}\n\n${draft}\n`
+  return draft
+}
+
+function proposalDiff(before: string, after: string): DiffLine[] {
+  const left = before.split('\n')
+  const right = after.split('\n')
+  if (left.length * right.length > 60_000) {
+    return [
+      ...left.map((text) => ({ kind: 'removed' as const, text })),
+      ...right.map((text) => ({ kind: 'added' as const, text })),
+    ]
+  }
+  const dp = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1))
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      dp[i]![j] = left[i] === right[j] ? 1 + dp[i + 1]![j + 1]! : Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!)
+    }
+  }
+  const result: DiffLine[] = []
+  let i = 0
+  let j = 0
+  while (i < left.length || j < right.length) {
+    if (i < left.length && j < right.length && left[i] === right[j]) {
+      result.push({ kind: 'same', text: left[i++]! }); j += 1
+    } else if (j < right.length && (i === left.length || dp[i]![j + 1]! >= dp[i + 1]![j]!)) {
+      result.push({ kind: 'added', text: right[j++]! })
+    } else {
+      result.push({ kind: 'removed', text: left[i++]! })
+    }
+  }
+  return result
+}
+
 function useLocale(ctx: ClientContext) {
   return useSyncExternalStore(
     (listener) => ctx.locale.subscribe(listener),
@@ -86,6 +124,13 @@ export interface KnowledgePanelViewProps {
 function hitTone(kind: InboxItem['kind']): string { return KIND_TONE[kind] }
 function statusTone(status: InboxItem['status']): string { return STATUS_TONE[status] }
 
+function sessionResourceAddress(sessionId: string, sourcePath: string, relPath: string): string {
+  const fullPath = `${sourcePath.replace(/[\\/]+$/u, '')}/${relPath}`.replace(/\\/gu, '/')
+  const encodedPath = fullPath.split('/').map((segment) => encodeURIComponent(segment)
+    .replace(/%3A/giu, ':').replace(/\(/gu, '%28').replace(/\)/gu, '%29')).join('/')
+  return `dsh-resource://file/session/${encodeURIComponent(sessionId)}/${encodedPath}`
+}
+
 export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): ReactElement {
   const active = useLocale(ctx)
   const t = useMemo(() => knowledgeT(active), [active])
@@ -98,6 +143,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   const [browseLoading, setBrowseLoading] = useState(false)
   const [browseError, setBrowseError] = useState<string | null>(null)
   const [previewDocument, setPreviewDocument] = useState<ReadDoc | null>(null)
+  const [pendingHeadingFragment, setPendingHeadingFragment] = useState<string | null>(null)
   const [previewReturnTab, setPreviewReturnTab] = useState<'search' | 'browse'>('search')
   const [sources, setSources] = useState<KnowledgeSourceInfo[]>([])
   const [sourceError, setSourceError] = useState<string | null>(null)
@@ -107,14 +153,28 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   const [sourceSaving, setSourceSaving] = useState(false)
   const [sourcePicking, setSourcePicking] = useState(false)
   const [sourceFormError, setSourceFormError] = useState<string | null>(null)
-  const [hits, setHits] = useState<{ sourceId: string; path: string; title: string; tags: string[]; snippet: string | null }[]>([])
+  const [confirmSourceId, setConfirmSourceId] = useState<string | null>(null)
+  const [sourceRemovalLoading, setSourceRemovalLoading] = useState(false)
+  const [hits, setHits] = useState<SearchHit[]>([])
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [openError, setOpenError] = useState<string | null>(null)
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null)
   const [items, setItems] = useState<InboxItem[]>([])
   const [inboxError, setInboxError] = useState<string | null>(null)
+  const [conflictDocument, setConflictDocument] = useState<ReadDoc | null>(null)
+  const [conflictLoading, setConflictLoading] = useState(false)
+  const [inboxFilter, setInboxFilter] = useState<InboxItem['status'] | 'all'>('all')
+  const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null)
+  const [editingInboxId, setEditingInboxId] = useState<string | null>(null)
+  const [draftText, setDraftText] = useState('')
+  const [confirmItemId, setConfirmItemId] = useState<string | null>(null)
+  const [confirmRevision, setConfirmRevision] = useState<number | null>(null)
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set())
+  const panelRootRef = useRef<HTMLDivElement | null>(null)
   const sourceRefreshSequence = useRef(0)
+  const documentReadSequence = useRef(0)
+  const searchSequence = useRef(0)
   const browseSelection = browseSourceId || sources[0]?.id || ''
   const selectedBrowseSource = sources.find((source) => source.id === browseSelection)
 
@@ -181,6 +241,20 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     }
   }
 
+  const reindexSource = async (source: KnowledgeSourceInfo): Promise<void> => {
+    setBusyIds((prev) => new Set(prev).add(source.id))
+    setSourceError(null)
+    try {
+      const result = await rpc.indexSource(source.id)
+      if (result.ok) setSources((prev) => prev.map((entry) => entry.id === source.id ? result.source : entry))
+      else setSourceError(result.message)
+    } catch (error) {
+      setSourceError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusyIds((prev) => { const next = new Set(prev); next.delete(source.id); return next })
+    }
+  }
+
   const removeSource = async (source: KnowledgeSourceInfo): Promise<void> => {
     setSourceFormError(null)
     setBusyIds((prev) => new Set(prev).add(source.id))
@@ -188,7 +262,15 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
       const result = await rpc.removeSource(source.id)
       if (result.ok) {
         sourceRefreshSequence.current += 1
+        documentReadSequence.current += 1
+        setConfirmSourceId(null)
         setSources((prev) => prev.filter((entry) => entry.id !== source.id))
+        setItems((prev) => prev.map((item) => item.sourceId === source.id && item.status === 'pending'
+          ? { ...item, status: 'conflicted', conflictMessage: 'knowledge source was removed; this proposal is retained but cannot be applied' }
+          : item))
+        setConflictDocument(null)
+        if (sourceId === source.id) setSourceId('')
+        if (previewDocument?.sourceId === source.id) { setPreviewDocument(null); setTab('search') }
         if (browseSourceId === source.id) {
           setBrowseSourceId('')
           setBrowsePath('')
@@ -203,7 +285,41 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     }
   }
 
+  const requestSourceRemoval = async (source: KnowledgeSourceInfo): Promise<void> => {
+    setSourceRemovalLoading(true)
+    setSourceFormError(null)
+    try {
+      const result = await rpc.listInbox()
+      if (!result.ok) {
+        setSourceFormError(result.message)
+        return
+      }
+      const latestItems = [...result.items].reverse()
+      setItems(latestItems)
+      setConfirmSourceId(source.id)
+    } catch (error) {
+      setSourceFormError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSourceRemovalLoading(false)
+    }
+  }
+
   const needsSourceRefresh = sources.some((source) => source.indexedAt === null && source.lastError === null)
+
+  useEffect(() => {
+    if (tab !== 'preview') documentReadSequence.current += 1
+  }, [tab])
+
+  useEffect(() => {
+    if (tab !== 'preview' || previewDocument === null || pendingHeadingFragment === null) return
+    const headingId = slugHeading(pendingHeadingFragment)
+    const article = panelRootRef.current?.querySelector('.dsh-obsidian-markdown') ?? null
+    const heading = article === null
+      ? undefined
+      : [...article.querySelectorAll('h1, h2, h3, h4, h5, h6')].find((element) => element.id === headingId)
+    heading?.scrollIntoView?.({ block: 'start', behavior: 'smooth' })
+    setPendingHeadingFragment(null)
+  }, [tab, previewDocument, pendingHeadingFragment])
 
   useEffect(() => {
     if (tab === 'inbox') return
@@ -219,7 +335,9 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   useEffect(() => {
     void rpc.listInbox().then((result) => {
       if (result.ok) {
-        setItems([...result.items].reverse())
+        const nextItems = [...result.items].reverse()
+        setItems(nextItems)
+        setSelectedInboxId((current) => current ?? nextItems[0]?.id ?? null)
         setInboxError(null)
       } else {
         setInboxError(result.message)
@@ -256,67 +374,251 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     return () => { cancelled = true }
   }, [tab, browseSelection, browsePath, selectedBrowseSource?.indexedAt, selectedBrowseSource?.lastError, rpc])
 
-  const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string): Promise<void> => {
+  const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string, headingFragment?: string): Promise<void> => {
+    const requestId = ++documentReadSequence.current
     setOpenError(null)
     try {
       const result = await rpc.read(source.id, relPath)
+      if (requestId !== documentReadSequence.current) return
       if (result.ok) {
-        setPreviewReturnTab(tab === 'browse' ? 'browse' : 'search')
+        const returnTab = tab === 'browse' ? 'browse' : tab === 'preview' ? previewReturnTab : 'search'
+        setPreviewReturnTab(returnTab)
         setPreviewDocument(result)
+        setPendingHeadingFragment(headingFragment ?? null)
         setTab('preview')
       } else {
         setOpenError(result.message)
       }
     } catch (error) {
+      if (requestId === documentReadSequence.current) setOpenError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const copyPreviewPath = async (): Promise<void> => {
+    if (!previewDocument) return
+    try {
+      await navigator.clipboard.writeText(previewDocument.path)
+      setCopyFeedback(t('copiedPath'))
+    } catch {
+      setCopyFeedback(t('copyPathFailed'))
+    }
+  }
+
+  const citationFor = (hit: SearchHit, source?: KnowledgeSourceInfo): string => {
+    const location = `${source?.name ?? hit.sourceId} · ${hit.path}${hit.line === null ? '' : `:${hit.line}`}`
+    const citation = `> ${hit.title} — ${location}${hit.snippet ? `\n> ${hit.snippet.replace(/\s+/gu, ' ').trim()}` : ''}`
+    if (!source) return citation
+    const root = source.path.replace(/[\\/]+$/u, '').replace(/\\/gu, '/')
+    const relativePath = hit.path.replace(/^[\\/]+/u, '').replace(/\\/gu, '/')
+    const absolutePath = `${root}/${relativePath}`
+    const linkPath = absolutePath.split('/').map((segment) => encodeURIComponent(segment).replace(/%3A/giu, ':')).join('/')
+    const line = hit.line === null ? '' : `#L${hit.line}`
+    return `${citation}\n> [${t('openInDsh')}](<${linkPath}${line}>)`
+  }
+
+  const copyCitation = async (hit: SearchHit, source?: KnowledgeSourceInfo): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(citationFor(hit, source))
+      setCopyFeedback(t('copiedCitation'))
+    } catch {
+      setCopyFeedback(t('copyCitationFailed'))
+    }
+  }
+
+  const openNativeFile = (source: KnowledgeSourceInfo, relPath: string, line: number | null): void => {
+    const hostContext = ctx as unknown as {
+      sidebarRight?: {
+        mounted: { getSnapshot(): string | undefined }
+        openResource(address: string, options?: { params?: { line?: number } }): void
+      }
+      layout?: { selectPanel(panelId: string | null): void }
+    }
+    const navigation = hostContext.sidebarRight
+    if (!navigation) {
+      setOpenError(t('nativeOpenUnavailable'))
+      return
+    }
+    let sessionId = navigation.mounted.getSnapshot()
+    if (!sessionId) {
+      hostContext.layout?.selectPanel(null)
+      sessionId = navigation.mounted.getSnapshot()
+    }
+    if (!sessionId) {
+      setOpenError(t('nativeOpenUnavailable'))
+      return
+    }
+    const address = sessionResourceAddress(sessionId, source.path, relPath)
+    try {
+      navigation.openResource(address, line === null ? undefined : { params: { line } })
+    } catch (error) {
       setOpenError(error instanceof Error ? error.message : String(error))
     }
   }
 
-  const runSearch = (searchQuery = query, searchSource = sourceId) => {
+  const runSearch = useCallback((searchQuery = query, searchSource = sourceId) => {
+    const requestId = ++searchSequence.current
     const trimmed = searchQuery.trim()
     setSearchError(null)
-    if (trimmed === '') { setHits([]); return }
+    if (trimmed === '') { setHits([]); setSearching(false); return }
     setSearching(true)
     void rpc.search(trimmed, { sourceId: searchSource || undefined, field: 'all', limit: 30 })
       .then((result) => {
+        if (requestId !== searchSequence.current) return
         if (result.ok) setHits(result.hits)
         else { setHits([]); setSearchError(result.message) }
       })
       .catch((error) => {
+        if (requestId !== searchSequence.current) return
         setHits([])
         setSearchError(error instanceof Error ? error.message : String(error))
       })
-      .finally(() => setSearching(false))
+      .finally(() => {
+        if (requestId === searchSequence.current) setSearching(false)
+      })
+  }, [query, rpc, sourceId])
+
+  useEffect(() => {
+    if (tab !== 'search') return
+    const scheduledRequest = ++searchSequence.current
+    const timer = setTimeout(() => {
+      if (scheduledRequest === searchSequence.current) runSearch(query, sourceId)
+    }, 300)
+    return () => {
+      clearTimeout(timer)
+      if (scheduledRequest === searchSequence.current) searchSequence.current += 1
+    }
+  }, [query, sourceId, tab, runSearch])
+
+  const requestApplyItem = (item: InboxItem) => {
+    setConfirmItemId(item.id)
+    setConfirmRevision(item.revision)
   }
 
-  const applyItem = (item: InboxItem) => {
+  const confirmApplyItem = async (item: InboxItem): Promise<void> => {
+    if (confirmRevision === null || item.revision !== confirmRevision) {
+      setInboxError(t('inboxConfirmationStale'))
+      setConfirmItemId(null)
+      setConfirmRevision(null)
+      return
+    }
     setBusyIds((prev) => new Set(prev).add(item.id))
-    void rpc.applyInbox(item.id).then((result) => {
+    setInboxError(null)
+    try {
+      const result = await rpc.applyInbox(item.id, confirmRevision)
       if (result.ok && result.itemId === item.id) {
         setItems((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, status: 'applied' as const } : entry))
+        if (result.statusError != null) setInboxError(`File was applied, but the Inbox status could not be saved: ${result.statusError}`)
+        else if (result.syncError != null) setInboxError(`File was applied, but index sync needs attention: ${result.syncError}`)
+        setConfirmItemId(null)
+        setConfirmRevision(null)
+        void refreshSources()
+      } else if (!result.ok && result.code === 'STALE_CONFIRMATION') {
+        setInboxError(result.message)
+        setConfirmItemId(null)
+        setConfirmRevision(null)
+        const latest = await rpc.listInbox()
+        if (latest.ok) setItems([...latest.items].reverse())
       } else if (!result.ok && result.code === 'CONFLICT') {
         setItems((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, status: 'conflicted' as const, conflictMessage: result.message } : entry))
+        setInboxError(result.message)
+        setConfirmItemId(null)
+        setConfirmRevision(null)
+      } else if (!result.ok) {
+        setInboxError(result.message)
       }
-    }).finally(() => {
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : String(error))
+    } finally {
       setBusyIds((prev) => { const next = new Set(prev); next.delete(item.id); return next })
-    })
+    }
   }
 
-  const dismissItem = (item: InboxItem) => {
+  const saveDraft = async (item: InboxItem): Promise<void> => {
     setBusyIds((prev) => new Set(prev).add(item.id))
-    void rpc.dismissInbox(item.id).then((result) => {
+    setInboxError(null)
+    try {
+      const result = await rpc.updateInboxDraft(item.id, draftText)
+      if (result.ok) {
+        setItems((prev) => prev.map((entry) => entry.id === item.id ? result.item : entry))
+        setEditingInboxId((current) => current === item.id ? null : current)
+      } else {
+        setInboxError(`${t('inboxDraftSaveFailed')}: ${result.message}`)
+      }
+    } catch (error) {
+      setInboxError(`${t('inboxDraftSaveFailed')}: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setBusyIds((prev) => { const next = new Set(prev); next.delete(item.id); return next })
+    }
+  }
+
+  const rebaseConflict = async (item: InboxItem, operation?: 'append' | 'update'): Promise<void> => {
+    setBusyIds((prev) => new Set(prev).add(item.id))
+    setInboxError(null)
+    try {
+      const result = await rpc.rebaseInbox(item.id, operation)
+      if (result.ok) {
+        setItems((prev) => [result.item, ...prev])
+        setSelectedInboxId(result.item.id)
+        setInboxFilter('all')
+        setEditingInboxId(null)
+        setConflictDocument(null)
+      } else {
+        setInboxError(result.message)
+      }
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBusyIds((prev) => { const next = new Set(prev); next.delete(item.id); return next })
+    }
+  }
+
+  const compareConflict = async (item: InboxItem): Promise<void> => {
+    setConflictLoading(true)
+    setInboxError(null)
+    try {
+      const result = await rpc.read(item.sourceId, item.targetPath)
+      if (result.ok) setConflictDocument(result)
+      else setInboxError(result.message)
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setConflictLoading(false)
+    }
+  }
+
+  const dismissItem = async (item: InboxItem): Promise<void> => {
+    setBusyIds((prev) => new Set(prev).add(item.id))
+    setInboxError(null)
+    try {
+      const result = await rpc.dismissInbox(item.id)
       if (result.ok) {
         setItems((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, status: 'dismissed' as const } : entry))
-      }
-    }).finally(() => {
+      } else setInboxError(result.message)
+    } catch (error) {
+      setInboxError(error instanceof Error ? error.message : String(error))
+    } finally {
       setBusyIds((prev) => { const next = new Set(prev); next.delete(item.id); return next })
-    })
+    }
   }
 
   const pendingCount = items.filter((item) => item.status === 'pending').length
+  const filteredInboxItems = items.filter((item) => inboxFilter === 'all' || item.status === inboxFilter)
+  const selectedInboxItem = filteredInboxItems.find((item) => item.id === selectedInboxId) ?? filteredInboxItems[0]
+  const selectedInboxSourceExists = selectedInboxItem !== undefined && sources.some((source) => source.id === selectedInboxItem.sourceId)
+  const confirmingItem = items.find((item) => item.id === confirmItemId && item.status === 'pending')
+  const confirmationStale = confirmingItem !== undefined && confirmRevision !== confirmingItem.revision
+  const confirmingSource = sources.find((source) => source.id === confirmSourceId)
+  const pendingForConfirmSource = confirmingSource ? items.filter((item) => item.sourceId === confirmingSource.id && item.status === 'pending').length : 0
+
+  const openLinkedDocument = async (relativePath: string, fragment?: string): Promise<void> => {
+    if (!previewDocument) return
+    const source = sources.find((entry) => entry.id === previewDocument.sourceId)
+    if (!source) return
+    await readAndPreviewDocument(source, relativePath, fragment)
+  }
 
   return (
-    <div style={s.root}>
+    <div ref={panelRootRef} style={s.root}>
       <div style={s.header}>
         <span style={{ fontWeight: 600, fontSize: 13 }}>{t('panelLabel')}</span>
         <div style={{ flex: 1 }} />
@@ -361,10 +663,14 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                 <div key={`${hit.sourceId}/${hit.path}`} style={s.hit}>
                   <div style={s.hitTitle}>
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{hit.title}</span>
-                    {source ? <button style={s.button()} onClick={() => void readAndPreviewDocument(source, hit.path)}>{t('openFile')}</button> : null}
+                    {source ? <>
+                      <button style={s.button()} onClick={() => void readAndPreviewDocument(source, hit.path)}>{t('openFile')}</button>
+                      <button style={s.button()} onClick={() => openNativeFile(source, hit.path, hit.line)}>{t('openInDsh')}</button>
+                    </> : null}
                   </div>
-                  <div style={s.hitMeta}>{hit.sourceId} · {hit.path}</div>
+                  <div style={s.hitMeta}>{source?.name ?? hit.sourceId} · {hit.path}{hit.line === null ? '' : ` · ${t('matchLine')} ${hit.line}`}</div>
                   {hit.snippet ? <div style={s.hitSnippet}>{hit.snippet}</div> : null}
+                  <button type="button" style={{ ...s.button(), marginTop: 5 }} onClick={() => void copyCitation(hit, source)}>{t('copyCitation')}</button>
                   {hit.tags.length > 0 ? (
                     <div style={s.tags}>{hit.tags.map((tag) => <span key={tag} style={s.tag}>#{tag}</span>)}</div>
                   ) : null}
@@ -383,13 +689,19 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                 <div style={s.hitMeta}>{previewDocument.sourceId} · {previewDocument.path}</div>
               </div>
             ) : null}
+            {previewDocument ? <button type="button" style={s.button()} onClick={() => {
+              const source = sources.find((entry) => entry.id === previewDocument.sourceId)
+              if (source) openNativeFile(source, previewDocument.path, null)
+            }}>{t('openInDsh')}</button> : null}
+            {previewDocument ? <button type="button" style={s.button()} onClick={() => void copyPreviewPath()}>{t('copyPath')}</button> : null}
           </div>
+          {copyFeedback ? <div role="status" style={s.hitMeta}>{copyFeedback}</div> : null}
           {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
           {previewDocument?.tags.length ? (
             <div style={s.tags}>{previewDocument.tags.map((tag) => <span key={tag} style={s.tag}>#{tag}</span>)}</div>
           ) : null}
           <div style={{ ...s.body, padding: 0 }}>
-            {previewDocument ? <pre style={s.previewContent}>{previewDocument.content}</pre> : null}
+            {previewDocument ? <MarkdownView content={previewDocument.content} links={previewDocument.links} onNavigate={(path, fragment) => void openLinkedDocument(path, fragment)} /> : null}
           </div>
         </>
       ) : tab === 'browse' ? (
@@ -455,7 +767,10 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                         <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{document.title}</div>
                         <div style={s.hitMeta}>{document.path}</div>
                       </div>
-                      {canOpen && source ? <button style={s.button()} onClick={() => void readAndPreviewDocument(source, document.path)}>{t('openFile')}</button> : null}
+                      {canOpen && source ? <>
+                        <button style={s.button()} onClick={() => void readAndPreviewDocument(source, document.path)}>{t('openFile')}</button>
+                        <button style={s.button()} onClick={() => openNativeFile(source, document.path, null)}>{t('openInDsh')}</button>
+                      </> : null}
                     </div>
                   )
                 })}
@@ -473,9 +788,12 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600 }}>{source.name}</div>
                   <div style={{ ...s.hitMeta, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.path}</div>
-                  <div style={s.hitMeta}>{source.lastError ?? (source.indexedAt === null ? t('sourceReindexing') : `${source.fileCount} · ${new Date(source.indexedAt).toLocaleString()}`)}</div>
+                  <div style={s.hitMeta}>{source.lastError ?? (busyIds.has(source.id) || source.indexedAt === null ? t('sourceReindexing') : `${source.fileCount} · ${new Date(source.indexedAt).toLocaleString()}`)}</div>
+                  {source.lastError ? <div style={s.hitMeta}>{t('sourceErrorHelp')}</div> : null}
+                  <div style={s.hitMeta}>{t('sourceSkipPolicy')}</div>
                 </div>
-                <button style={s.button('danger')} disabled={busyIds.has(source.id)} onClick={() => void removeSource(source)}>{t('settingsSourceRemove')}</button>
+                <button style={s.button()} disabled={busyIds.has(source.id)} onClick={() => void reindexSource(source)}>{t('sourceReindex')}</button>
+                <button style={s.button('danger')} disabled={busyIds.has(source.id) || sourceRemovalLoading} onClick={() => void requestSourceRemoval(source)}>{t('settingsSourceRemove')}</button>
               </div>
             ))}
             <div style={s.sourceForm}>
@@ -507,30 +825,126 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
       ) : (
         <div style={s.body}>
           {inboxError ? <div style={s.empty} role="alert">{inboxError}</div> : null}
-          {items.length === 0 ? (
-            <div style={s.empty}>{t('inboxEmpty')}</div>
-          ) : items.map((item) => (
-            <div key={item.id} style={s.row}>
-              <span style={s.badge(hitTone(item.kind))}>{item.kind}</span>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.title}</div>
-                <div style={{ color: 'rgba(127,127,127,0.8)', fontSize: 11 }}>
-                  {item.sourceId} · {item.targetPath}
-                  {item.status === 'conflicted' && item.conflictMessage ? ` · ${item.conflictMessage}` : ''}
-                </div>
+          <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }} aria-label="Inbox status filter">
+            {(['all', 'pending', 'conflicted', 'applied', 'dismissed'] as const).map((status) => {
+              const label = status === 'all' ? t('inboxFilterAll') : status === 'pending' ? t('inboxFilterPending') : t(`inbox${status[0]!.toUpperCase()}${status.slice(1)}` as KnowledgeKey)
+              return <button key={status} type="button" aria-pressed={inboxFilter === status} style={s.button(inboxFilter === status ? 'primary' : 'plain')} onClick={() => setInboxFilter(status)}>{label}</button>
+            })}
+          </div>
+          {items.length === 0 ? <div style={s.empty}>{t('inboxEmpty')}</div> : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.34fr) minmax(0, 1fr)', gap: 12, minHeight: 0 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: '100%', overflowY: 'auto' }} aria-label="Proposals">
+                {filteredInboxItems.map((item) => (
+                  <button key={item.id} type="button" aria-pressed={selectedInboxItem?.id === item.id} onClick={() => { setSelectedInboxId(item.id); setEditingInboxId(null); setConflictDocument(null) }} style={{ ...s.row, cursor: 'pointer', textAlign: 'left', background: selectedInboxItem?.id === item.id ? 'rgba(68,120,255,0.12)' : 'rgba(127,127,127,0.06)' }}>
+                    <span style={s.badge(hitTone(item.kind))}>{item.kind}</span>
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ display: 'block', fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.title}</span>
+                      <span style={s.hitMeta}>{item.sourceId} · {item.targetPath}</span>
+                    </span>
+                    <span style={s.badge(statusTone(item.status))}>{t(`inbox${item.status[0]!.toUpperCase()}${item.status.slice(1)}` as KnowledgeKey)}</span>
+                  </button>
+                ))}
+                {filteredInboxItems.length === 0 ? <div style={s.empty}>{t('inboxEmpty')}</div> : null}
               </div>
-              {item.status === 'pending' ? (
-                <button style={s.button('primary')} disabled={busyIds.has(item.id)} onClick={() => applyItem(item)}>{t('inboxApply')}</button>
-              ) : (
-                <span style={s.badge(statusTone(item.status))}>{t(`inbox${item.status[0].toUpperCase()}${item.status.slice(1)}` as KnowledgeKey)}</span>
-              )}
-              {item.status === 'pending' || item.status === 'conflicted' ? (
-                <button style={s.button('danger')} disabled={busyIds.has(item.id)} onClick={() => dismissItem(item)}>{t('inboxDismiss')}</button>
+              {selectedInboxItem ? (
+                <section aria-label="Proposal review" style={{ minWidth: 0, overflowY: 'auto', padding: 12, border: '1px solid rgba(127,127,127,0.18)', borderRadius: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'start', gap: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <h2 style={{ margin: '0 0 5px', fontSize: 16 }}>{selectedInboxItem.title}</h2>
+                      <div style={s.hitMeta}>{selectedInboxItem.sourceId} · {selectedInboxItem.targetPath} · {selectedInboxItem.kind} · {t('inboxAgent')}: {selectedInboxItem.agentId ?? t('inboxAgentUnknown')}{selectedInboxItem.rebasedFrom ? ` · ${t('inboxRebasedFrom')}: ${selectedInboxItem.rebasedFrom}` : ''} · {new Date(selectedInboxItem.createdAt).toLocaleString()}</div>
+                    </div>
+                    <span style={s.badge(statusTone(selectedInboxItem.status))}>{t(`inbox${selectedInboxItem.status[0]!.toUpperCase()}${selectedInboxItem.status.slice(1)}` as KnowledgeKey)}</span>
+                  </div>
+                  {selectedInboxItem.conflictMessage ? <div role="alert" style={{ ...s.hit, marginTop: 10, borderColor: 'rgba(210,70,70,0.4)' }}>{selectedInboxItem.conflictMessage}</div> : null}
+                  {selectedInboxItem.status === 'pending' && !selectedInboxSourceExists ? <div role="alert" style={{ ...s.hit, marginTop: 10, borderColor: 'rgba(210,70,70,0.4)' }}>{t('sourceRemovePending')}</div> : null}
+                  {selectedInboxItem.status === 'conflicted' && selectedInboxSourceExists ? <button type="button" style={{ ...s.button(), marginTop: 8 }} disabled={conflictLoading} onClick={() => void compareConflict(selectedInboxItem)}>{conflictLoading ? '…' : t('inboxCompareCurrent')}</button> : null}
+                  {selectedInboxItem.status === 'conflicted' && conflictDocument?.sourceId === selectedInboxItem.sourceId && conflictDocument.path === selectedInboxItem.targetPath ? (
+                    <div style={{ marginTop: 12 }}>
+                      <h3 style={{ margin: '0 0 6px', fontSize: 12 }}>{t('inboxCurrentFile')}</h3>
+                      <pre style={{ ...s.previewContent, maxHeight: 220, overflow: 'auto', border: '1px solid rgba(127,127,127,0.18)', borderRadius: 6 }}>{conflictDocument.content}</pre>
+                      <h3 style={{ margin: '12px 0 6px', fontSize: 12 }}>{t('inboxBaselineDiff')} · current vs proposal</h3>
+                      <pre style={{ ...s.previewContent, maxHeight: 220, overflow: 'auto', border: '1px solid rgba(127,127,127,0.18)', borderRadius: 6 }}>
+                        {proposalDiff(conflictDocument.content, finalProposalContent(selectedInboxItem)).map((line, index) => (
+                          <span key={`${index}:${line.kind}`} style={{ display: 'block', color: line.kind === 'added' ? '#4d8a61' : line.kind === 'removed' ? '#b05c5c' : 'inherit' }}>{line.kind === 'added' ? '+ ' : line.kind === 'removed' ? '− ' : '  '}{line.text || ' '}</span>
+                        ))}
+                      </pre>
+                    </div>
+                  ) : null}
+                  {selectedInboxItem.status === 'conflicted' && selectedInboxSourceExists && conflictDocument?.sourceId === selectedInboxItem.sourceId && conflictDocument.path === selectedInboxItem.targetPath ? (
+                    selectedInboxItem.kind === 'create' ? (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
+                        <span style={s.hitMeta}>{t('inboxCreateConflictChooseOperation')}</span>
+                        <button type="button" style={s.button('primary')} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => void rebaseConflict(selectedInboxItem, 'update')}>{t('inboxRebaseCreateUpdate')}</button>
+                        <button type="button" style={s.button()} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => void rebaseConflict(selectedInboxItem, 'append')}>{t('inboxRebaseCreateAppend')}</button>
+                      </div>
+                    ) : <button type="button" style={{ ...s.button('primary'), marginTop: 10 }} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => void rebaseConflict(selectedInboxItem)}>{t('inboxRebase')}</button>
+                  ) : null}
+                  <div style={{ marginTop: 12 }}>
+                    <h3 style={{ margin: '0 0 6px', fontSize: 12 }}>{t('inboxFinalContent')}</h3>
+                    {editingInboxId === selectedInboxItem.id ? (
+                      <textarea aria-label="Draft content" value={draftText} disabled={busyIds.has(selectedInboxItem.id)} maxLength={200_000} onChange={(event) => setDraftText(event.target.value)} style={{ ...s.input, display: 'block', width: '100%', minHeight: 110, resize: 'vertical', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }} />
+                    ) : null}
+                    <pre style={{ ...s.previewContent, maxHeight: 220, overflow: 'auto', border: '1px solid rgba(127,127,127,0.18)', borderRadius: 6 }}>{finalProposalContent(selectedInboxItem, editingInboxId === selectedInboxItem.id ? draftText : selectedInboxItem.body)}</pre>
+                  </div>
+                  {selectedInboxItem.kind !== 'create' ? (
+                    <div style={{ marginTop: 12 }}>
+                      <h3 style={{ margin: '0 0 6px', fontSize: 12 }}>{t('inboxBaselineDiff')}</h3>
+                      <pre style={{ ...s.previewContent, maxHeight: 220, overflow: 'auto', border: '1px solid rgba(127,127,127,0.18)', borderRadius: 6 }}>
+                        {proposalDiff(selectedInboxItem.baselineContent ?? '', finalProposalContent(selectedInboxItem, editingInboxId === selectedInboxItem.id ? draftText : selectedInboxItem.body)).map((line, index) => (
+                          <span key={`${index}:${line.kind}`} style={{ display: 'block', color: line.kind === 'added' ? '#4d8a61' : line.kind === 'removed' ? '#b05c5c' : 'inherit', background: line.kind === 'added' ? 'rgba(77,138,97,0.08)' : line.kind === 'removed' ? 'rgba(176,92,92,0.08)' : 'transparent' }}>{line.kind === 'added' ? '+ ' : line.kind === 'removed' ? '− ' : '  '}{line.text || ' '}</span>
+                        ))}
+                      </pre>
+                    </div>
+                  ) : null}
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 12 }}>
+                    {selectedInboxItem.status === 'pending' && editingInboxId !== selectedInboxItem.id ? <button type="button" style={s.button()} onClick={() => { setDraftText(selectedInboxItem.body); setEditingInboxId(selectedInboxItem.id) }}>{t('inboxEditDraft')}</button> : null}
+                    {editingInboxId === selectedInboxItem.id ? <>
+                      <button type="button" style={s.button('primary')} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => void saveDraft(selectedInboxItem)}>{t('inboxSaveDraft')}</button>
+                      <button type="button" style={s.button()} onClick={() => { setEditingInboxId(null); setDraftText(selectedInboxItem.body) }}>{t('inboxCancelEdit')}</button>
+                    </> : null}
+                    {selectedInboxItem.status === 'pending' && selectedInboxSourceExists && editingInboxId !== selectedInboxItem.id ? <button type="button" style={s.button('primary')} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => requestApplyItem(selectedInboxItem)}>{t('inboxApplyToFile')}</button> : null}
+                    {['pending', 'conflicted'].includes(selectedInboxItem.status) ? <button type="button" style={s.button('danger')} disabled={busyIds.has(selectedInboxItem.id)} onClick={() => dismissItem(selectedInboxItem)}>{t('inboxDismiss')}</button> : null}
+                  </div>
+                </section>
               ) : null}
             </div>
-          ))}
+          )}
         </div>
       )}
+
+      {confirmingItem ? (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', padding: 18, background: 'rgba(20,24,30,0.45)' }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="proposal-confirm-title" style={{ maxWidth: 480, width: '100%', padding: 20, borderRadius: 10, background: 'var(--dsh-color-background, #fff)', color: 'var(--dsh-color-text, #222)', boxShadow: '0 12px 40px rgba(0,0,0,0.2)' }}>
+            <h2 id="proposal-confirm-title" style={{ margin: '0 0 8px', fontSize: 16 }}>{t('inboxConfirmTitle')}</h2>
+            <p>{t('inboxConfirmBody')}</p>
+            <p><strong>{confirmingItem.sourceId} · {confirmingItem.targetPath}</strong></p>
+            <p style={s.hitMeta}>{t('inboxRevision')}: {confirmingItem.revision}</p>
+            <h3 style={{ margin: '8px 0 4px', fontSize: 12 }}>{t('inboxFinalContent')}</h3>
+            <pre style={{ ...s.previewContent, maxHeight: 180, overflow: 'auto', border: '1px solid rgba(127,127,127,0.18)', borderRadius: 6 }}>{finalProposalContent(confirmingItem)}</pre>
+            {confirmationStale ? <div role="alert" style={s.empty}>{t('inboxConfirmationStale')}</div> : null}
+            <div style={{ display: 'flex', justifyContent: 'end', gap: 8 }}>
+              <button type="button" style={s.button()} onClick={() => { setConfirmItemId(null); setConfirmRevision(null) }}>{t('inboxCancelEdit')}</button>
+              <button type="button" style={s.button('primary')} disabled={busyIds.has(confirmingItem.id) || confirmationStale} onClick={() => void confirmApplyItem(confirmingItem)}>{t('inboxConfirmApply')}</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {confirmingSource ? (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', padding: 18, background: 'rgba(20,24,30,0.45)' }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="source-remove-confirm-title" style={{ maxWidth: 480, width: '100%', padding: 20, borderRadius: 10, background: 'var(--dsh-color-background, #fff)', color: 'var(--dsh-color-text, #222)', boxShadow: '0 12px 40px rgba(0,0,0,0.2)' }}>
+            <h2 id="source-remove-confirm-title" style={{ margin: '0 0 8px', fontSize: 16 }}>{t('sourceRemoveConfirmTitle')}</h2>
+            <p>{t('sourceRemoveConfirmBody')}</p>
+            {pendingForConfirmSource > 0 ? <p role="alert">{t('sourceRemovePending')} ({pendingForConfirmSource})</p> : null}
+            <p><strong>{confirmingSource.name} · {confirmingSource.path}</strong></p>
+            {sourceFormError ? <div role="alert" style={s.hit}>{sourceFormError}</div> : null}
+            <div style={{ display: 'flex', justifyContent: 'end', gap: 8 }}>
+              <button type="button" style={s.button()} onClick={() => setConfirmSourceId(null)}>{t('inboxCancelEdit')}</button>
+              <button type="button" style={s.button('danger')} disabled={busyIds.has(confirmingSource.id)} onClick={() => void removeSource(confirmingSource)}>{t('sourceRemoveConfirmAction')}</button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <div style={s.footer}>
         {sources.map((source) => (

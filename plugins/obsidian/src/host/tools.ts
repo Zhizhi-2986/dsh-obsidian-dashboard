@@ -5,7 +5,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ProposeInputSchema, type ProposeInput } from '../shared/rpc-contract.ts'
 import type { KnowledgeService } from './knowledge-service.ts'
 
@@ -162,10 +162,11 @@ function defineKnowledgePropose(service: KnowledgeService) {
         text: JSON.stringify(value, null, 2),
       }],
     },
-    async execute(args: ProposeInput): Promise<ToolJson> {
+    async execute(args: ProposeInput, exec?: ToolRunContext): Promise<ToolJson> {
       const parsed = ProposeInputSchema.safeParse(args)
       if (!parsed.success) return { ok: false, code: 'INVALID', message: 'invalid proposal input' }
-      const result = await service.propose(parsed.data.sourceId, parsed.data)
+      const agentId = typeof exec?.agent?.id === 'string' ? exec.agent.id : null
+      const result = await service.propose(parsed.data.sourceId, parsed.data, exec?.signal, agentId)
       if (!result.ok) {
         return { ok: false, code: result.code, message: result.message }
       }

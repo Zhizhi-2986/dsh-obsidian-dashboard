@@ -21,7 +21,7 @@ export const NS = 'dsh-obsidian'
 
 export const FAIL_CODES = [
   'NOT_FOUND', 'OUT_OF_SCOPE', 'ALREADY_EXISTS', 'TOO_LARGE',
-  'INVALID', 'CONFLICT', 'SANDBOX_DENIED', 'NO_SESSION', 'IO',
+  'INVALID', 'OUTSIDE_SOURCE', 'PERMISSION_DENIED', 'READ_ONLY', 'CONFLICT', 'STALE_CONFIRMATION', 'SANDBOX_DENIED', 'NO_SESSION', 'IO',
 ] as const
 export type FailCode = (typeof FAIL_CODES)[number]
 
@@ -148,17 +148,30 @@ export type ReadDoc = z.infer<typeof ReadDocSchema>
 
 export const PROPOSAL_KINDS = ['create', 'append', 'update'] as const
 export type ProposalKind = (typeof PROPOSAL_KINDS)[number]
+export const REBASE_OPERATIONS = ['same', 'append', 'update'] as const
+export type RebaseOperation = (typeof REBASE_OPERATIONS)[number]
+
+export const InboxRevisionSchema = z.number().int().min(1)
+export type InboxRevision = z.infer<typeof InboxRevisionSchema>
 
 export const InboxItemSchema = z.object({
   id: z.string(),
   createdAt: z.number(),
+  /** Monotonic Inbox item revision for binding apply confirmations to reviewed content. */
+  revision: InboxRevisionSchema,
   kind: z.enum(PROPOSAL_KINDS),
   title: z.string(),
   /** Target: sourceId + relative path. */
   sourceId: z.string(),
   targetPath: z.string(),
+  /** Agent identifier from the DSH tool execution context; null for non-Agent proposals. */
+  agentId: z.string().nullable(),
+  /** Previous conflicted proposal from which this fresh baseline was created. */
+  rebasedFrom: z.string().nullable(),
   /** Proposed content for create; snippet/append text for append/update. */
   body: z.string().max(200_000),
+  /** Full target content captured when an append/update proposal was created. */
+  baselineContent: z.string().max(4_194_304),
   status: z.enum(['pending', 'applied', 'dismissed', 'conflicted']),
   /** Version token captured when the draft was proposed. */
   baseVersion: z.string().nullable(),
@@ -179,6 +192,8 @@ export const ApplyOkSchema = z.object({
   ok: z.literal(true),
   itemId: z.string(),
   version: z.string(),
+  statusError: z.string().nullable(),
+  syncError: z.string().nullable(),
 })
 export type ApplyOk = z.infer<typeof ApplyOkSchema>
 

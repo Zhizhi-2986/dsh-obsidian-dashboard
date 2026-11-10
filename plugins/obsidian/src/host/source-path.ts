@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
+import type { SourceRootIdentity } from '../shared/settings-contract.ts'
 
 /** Resolve a source-relative file while rejecting lexical traversal and symlinks.
  *  Symlink entries are deliberately rejected, including links that point back inside
@@ -16,6 +17,21 @@ export function normalizeSourceRelPath(relativePath: string): string | null {
   return normalized === '' || normalized === '.' || normalized.startsWith('../') ? null : normalized
 }
 
+export async function captureSourceRootIdentity(sourceRoot: string): Promise<{ path: string; identity: SourceRootIdentity }> {
+  const canonicalPath = await fs.realpath(sourceRoot)
+  const info = await fs.stat(canonicalPath)
+  if (!info.isDirectory()) throw new Error('knowledge source root is not a directory')
+  return { path: canonicalPath, identity: { dev: String(info.dev), ino: String(info.ino) } }
+}
+
+/** Verify that the configured root still identifies the registered directory. */
+export async function sourceRootIdentityMatches(sourceRoot: string, expected: SourceRootIdentity): Promise<boolean> {
+  const canonicalPath = await fs.realpath(sourceRoot)
+  if (canonicalPath !== sourceRoot) return false
+  const info = await fs.stat(canonicalPath)
+  return info.isDirectory() && String(info.dev) === expected.dev && String(info.ino) === expected.ino
+}
+
 export async function resolveContainedPath(sourceRoot: string, relativePath: string): Promise<string | null> {
   const normalized = normalizeSourceRelPath(relativePath)
   if (normalized === null) return null
@@ -23,7 +39,8 @@ export async function resolveContainedPath(sourceRoot: string, relativePath: str
   let root: string
   try {
     root = await fs.realpath(sourceRoot)
-  } catch {
+  } catch (error) {
+    if (isPermissionDenied(error)) throw error
     return null
   }
 
@@ -33,7 +50,8 @@ export async function resolveContainedPath(sourceRoot: string, relativePath: str
   let realParent: string
   try {
     realParent = await fs.realpath(path.dirname(candidate))
-  } catch {
+  } catch (error) {
+    if (isPermissionDenied(error)) throw error
     return null
   }
   if (!isWithin(root, realParent, true)) return null
@@ -45,6 +63,7 @@ export async function resolveContainedPath(sourceRoot: string, relativePath: str
     return isWithin(root, realTarget, false) ? realTarget : null
   } catch (error) {
     if (isMissing(error)) return path.join(realParent, path.basename(candidate))
+    if (isPermissionDenied(error)) throw error
     return null
   }
 }
@@ -57,4 +76,9 @@ function isWithin(root: string, candidate: string, allowRoot: boolean): boolean 
 
 function isMissing(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
+}
+
+function isPermissionDenied(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error &&
+    (error.code === 'EACCES' || error.code === 'EPERM')
 }

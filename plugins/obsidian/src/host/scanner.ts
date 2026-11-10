@@ -8,6 +8,7 @@
 
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
+import { resolveContainedPath } from './source-path.ts'
 
 export interface ScannedFile {
   /** Path relative to the source root, using `/` separators. */
@@ -65,12 +66,19 @@ export async function scanSource(
   options: ScanOptions = { include: [], exclude: [] },
   signal?: AbortSignal,
 ): Promise<ScannedFile[]> {
+  const sourceRoot = await fs.realpath(root)
   const extensions = options.noteExtensions ?? DEFAULT_NOTE_EXTENSIONS
   const accepted = new Set(extensions.map((ext) => ext.toLowerCase()))
   const results: ScannedFile[] = []
 
   const walk = async (dirAbs: string, dirRel: string): Promise<void> => {
     if (signal?.aborted) throw new DOMException('scan aborted', 'AbortError')
+    if (dirRel !== '') {
+      const verifiedDirectory = await resolveContainedPath(sourceRoot, dirRel)
+      if (verifiedDirectory === null || verifiedDirectory !== dirAbs) {
+        throw Object.assign(new Error('indexed directory escaped the configured source'), { code: 'OUTSIDE_SOURCE' })
+      }
+    }
     let entries
     try {
       entries = await fs.readdir(dirAbs, { withFileTypes: true })
@@ -78,7 +86,7 @@ export async function scanSource(
       // Missing nested directories can be ordinary concurrent removals. A
       // missing root or other I/O failure must abort the scan so callers do
       // not mistake an incomplete listing for an empty source.
-      if (dirAbs === root || !isMissing(error)) throw error
+      if (dirRel === '' || !isMissing(error)) throw error
       return
     }
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
@@ -95,19 +103,28 @@ export async function scanSource(
       const ext = path.extname(entry.name).toLowerCase()
       if (!accepted.has(ext)) continue
       if (!isIncluded(rel, options)) continue
-      let stat
+      const candidate = path.join(dirAbs, entry.name)
+      let pathInfo
       try {
-        stat = await fs.stat(path.join(dirAbs, entry.name))
+        pathInfo = await fs.lstat(candidate)
       } catch (error) {
         if (!isMissing(error)) throw error
         continue
       }
-      if (!stat.isFile()) continue
-      results.push({ relPath: rel, absPath: path.join(dirAbs, entry.name), mtimeMs: stat.mtimeMs, size: stat.size })
+      if (pathInfo.isSymbolicLink()) {
+        throw Object.assign(new Error('indexed file became a symbolic link'), { code: 'OUTSIDE_SOURCE' })
+      }
+      if (!pathInfo.isFile()) continue
+      const verifiedPath = await resolveContainedPath(sourceRoot, rel)
+      if (verifiedPath === null || verifiedPath !== candidate) {
+        throw Object.assign(new Error('indexed file escaped the configured source'), { code: 'OUTSIDE_SOURCE' })
+      }
+      const stat = await fs.stat(verifiedPath)
+      results.push({ relPath: rel, absPath: verifiedPath, mtimeMs: stat.mtimeMs, size: stat.size })
     }
   }
 
-  await walk(root, '')
+  await walk(sourceRoot, '')
   return results
 }
 

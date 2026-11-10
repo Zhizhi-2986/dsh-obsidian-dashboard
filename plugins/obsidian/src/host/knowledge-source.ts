@@ -11,7 +11,9 @@
 import { watch as watchFs, promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import type { KnowledgeSourceConfig } from '../shared/settings-contract.ts'
-import { readFileText } from './read-file.ts'
+import { sourceRootIdentityMatches } from './source-path.ts'
+import { readSourceFileText } from './read-file.ts'
+import { resolveContainedPath } from './source-path.ts'
 import { digestNote } from './markdown.ts'
 import { KnowledgeIndex } from './indexer.ts'
 import { fileStemOf, scanSource, toSourceRel, type ScanOptions } from './scanner.ts'
@@ -28,6 +30,7 @@ const FALLBACK_POLL_MS = 30_000
 export class KnowledgeSourceRuntime {
   readonly source: KnowledgeSourceConfig
   readonly #index: KnowledgeIndex
+  readonly #watchFactory: (root: string) => ReturnType<typeof watchFs> | null
   #state: SourceSyncState = { indexedAt: null, fileCount: 0, lastError: null }
   #watcher: ReturnType<typeof watchFs> | null = null
   #debounce: ReturnType<typeof setTimeout> | null = null
@@ -36,9 +39,10 @@ export class KnowledgeSourceRuntime {
   #syncChain: Promise<void> = Promise.resolve()
   #stopped = false
 
-  constructor(source: KnowledgeSourceConfig, index: KnowledgeIndex) {
+  constructor(source: KnowledgeSourceConfig, index: KnowledgeIndex, watchFactory = fsWatchRecursive) {
     this.source = source
     this.#index = index
+    this.#watchFactory = watchFactory
   }
 
   get state(): SourceSyncState {
@@ -49,7 +53,7 @@ export class KnowledgeSourceRuntime {
     if (this.#stopped) return
     // Recursive watch is supported on darwin/win32; try it, else poll.
     try {
-      const watcher = fsWatchRecursive(this.source.path)
+      const watcher = this.#watchFactory(this.source.path)
       if (watcher !== null) {
         this.#watcher = watcher
         watcher.on('change', (_event, filename) => {
@@ -119,6 +123,7 @@ export class KnowledgeSourceRuntime {
     if (this.#stopped) return
     const started = Date.now()
     try {
+      await this.#assertRootIdentity()
       const scanOptions: ScanOptions = {
         include: this.source.include,
         exclude: this.source.exclude,
@@ -127,16 +132,27 @@ export class KnowledgeSourceRuntime {
         // Incremental: reindex only the reported paths (mtime-diffed).
         let changed = 0
         for (const rel of dedupe(relPaths)) {
-          const abs = path.join(this.source.path, rel)
-          let stat
+          let pathInfo
           try {
-            stat = await fs.stat(abs)
-          } catch {
+            pathInfo = await fs.lstat(path.join(this.source.path, rel))
+          } catch (error) {
+            if (errorCode(error) !== 'ENOENT') throw error
+            const hasIndexedDescendants = [...this.#index.knownPaths(this.source.id)].some((known) => known.startsWith(`${rel}/`))
+            if (hasIndexedDescendants) return await this.#syncPath(null)
             this.#index.deleteDoc(this.source.id, rel)
             changed++
             continue
           }
-          if (!stat.isFile()) continue
+          if (pathInfo.isSymbolicLink()) throw Object.assign(new Error('indexed path became a symbolic link'), { code: 'OUTSIDE_SOURCE' })
+          if (pathInfo.isDirectory()) return await this.#syncPath(null)
+          if (!pathInfo.isFile()) {
+            this.#index.deleteDoc(this.source.id, rel)
+            changed++
+            continue
+          }
+          const safePath = await resolveContainedPath(this.source.path, rel)
+          if (safePath === null) throw Object.assign(new Error('indexed path left the configured source'), { code: 'OUTSIDE_SOURCE' })
+          const stat = await fs.stat(safePath)
           const existing = this.#index.getDoc(this.source.id, rel)
           if (existing !== null && existing.mtimeMs === stat.mtimeMs) continue
           await this.#indexFile(rel, stat.mtimeMs)
@@ -148,6 +164,7 @@ export class KnowledgeSourceRuntime {
         await this.#rebuildLinks([...this.#index.knownPaths(this.source.id)])
       } else {
         const files = await scanSource(this.source.path, scanOptions)
+        await this.#assertRootIdentity()
         const seen = new Set<string>()
         const known = this.#index.knownPaths(this.source.id)
         let added = 0
@@ -186,9 +203,16 @@ export class KnowledgeSourceRuntime {
     }
   }
 
+  async #assertRootIdentity(): Promise<void> {
+    if (this.source.rootIdentity !== undefined && !await sourceRootIdentityMatches(this.source.path, this.source.rootIdentity)) {
+      throw Object.assign(new Error('configured source root identity changed'), { code: 'OUTSIDE_SOURCE' })
+    }
+  }
+
   async #indexFile(relPath: string, mtimeMs: number): Promise<void> {
-    const abs = path.join(this.source.path, relPath)
-    const markdown = await readFileText(abs)
+    await this.#assertRootIdentity()
+    const markdown = await readSourceFileText(this.source.path, relPath)
+    await this.#assertRootIdentity()
     if (markdown === null) {
       this.#index.deleteDoc(this.source.id, relPath)
       return
@@ -200,8 +224,9 @@ export class KnowledgeSourceRuntime {
   async #rebuildLinks(relPaths: readonly string[]): Promise<void> {
     const known = this.#index.knownPaths(this.source.id)
     for (const relPath of relPaths) {
-      const abs = path.join(this.source.path, relPath)
-      const markdown = await readFileText(abs)
+      await this.#assertRootIdentity()
+      const markdown = await readSourceFileText(this.source.path, relPath)
+      await this.#assertRootIdentity()
       if (markdown === null) continue
       const digest = digestNote(markdown, fileStemOf(relPath))
       this.#index.setLinks(this.source.id, relPath, digest.links, known)
@@ -228,6 +253,12 @@ function dedupe(values: readonly string[]): string[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function errorCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code: unknown }).code)
+    : undefined
 }
 
 export { toSourceRel }

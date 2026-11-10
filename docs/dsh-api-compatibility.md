@@ -137,11 +137,11 @@ ctx.tools.register(defineTool({
 
 - **入口**：`sidebar.panellist`（id `knowledge`）+ `main` keyed panel（key `knowledge`）。
 - **知识源（当前实现）**：设置卡在 DSH Desktop 中使用内置 native bridge 选择目录（桥接缺失时回退到 `uiWorkspace.pickDirectory()`，也可手动输入）；Host 用 `node:fs` 扫描和读取文件，支持 include/exclude 与常见忽略目录。
-- **知识 UI / 搜索（当前实现）**：Client 提供“检索 / 浏览 / 收件箱”入口；浏览视图从索引按目录逐层列出子目录和笔记。检索失败在面板中显式显示；知识 RPC 为 profile-scoped，不要求活动 Session。
-- **打开文件（当前实现）**：工作区内文件通过 `sidebarRight.openResource(dsh-resource://file/session/...)` 交给原生资源视图；工作区外 Vault 文件不伪造 session 资源地址。
-- **写入（当前实现）**：收件箱审阅后通过 `ctx.fs.writeText` + 版本守卫写入，失败保留/标记提案状态；不绕过 sandbox。差异预览尚未实现。
-- **Agent（当前实现）**：仅注册只读检索/读取工具；提案写入只能由 UI 收件箱审核流发起。
-- **实机验证清单（尚未执行）**：panellist 行与会话切换、openResource 聚焦既有 Tab、外部 Vault 读/写 sandbox 行为、文件变更同步、深浅色/窄栏（AC-17）、禁用 dsh-enhanced 场景（AC-01）。
+- **知识 UI / 搜索（当前实现）**：Client 提供“检索 / 浏览 / 收件箱”入口；浏览视图从索引按目录逐层列出子目录和笔记。搜索结果展示来源、相对路径、匹配行与片段，可复制引用；知识 RPC 为 profile-scoped，不要求活动 Session。
+- **打开文件（当前实现）**：搜索结果、目录项和面板预览均提供原文入口，通过 rc.5 `sidebarRight.openResource` 和带授权 Session 的 `dsh-resource://file/session/<sessionId>//<absolute-path>` 交给原生资源导航。全局知识面板先用 `ctx.layout.selectPanel(null)` 返回当前会话，再使用其原生文件导航；文件能否读取仍由 DSH Session 文件系统与 sandbox 决定。
+- **写入（当前实现）**：收件箱审阅后通过 `ctx.fs.writeText` + 版本守卫写入，失败保留/标记提案状态；不绕过 sandbox。UI 提供提案与基线的差异预览。
+- **Agent（当前实现）**：可检索、读取并创建待审核提案；提案写入只能由 UI 收件箱审核流发起。
+- **实机验证（部分完成）**：此前在 DSH Desktop 2.0.18 nightly 中确认知识侧栏入口、已配置知识源和目录浏览视图可见。本轮构建和自动化测试通过；本轮 Desktop 无障碍树无法切换到知识面板，屏幕捕获失败，因而没有验证本轮构建的真实 UI。待验收项仍包括原生目录选择器、搜索引用/原文导航、提案差异审阅与写入、openResource 聚焦既有 Tab、外部 Vault 读/写 sandbox 行为、文件变更同步、深浅色/窄栏（AC-17）、禁用 dsh-enhanced 场景（AC-01）。
 
 ## 8. 结论
 

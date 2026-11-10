@@ -3,6 +3,7 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import type { KnowledgeSourceConfig } from '../shared/settings-contract.ts'
+import { ensurePrivateDirectory, ensurePrivateFile, writePrivateFile } from './private-storage.ts'
 
 export class KnowledgeSourceStore {
   readonly #file: string
@@ -12,7 +13,8 @@ export class KnowledgeSourceStore {
   }
 
   async load(legacySources: readonly KnowledgeSourceConfig[]): Promise<KnowledgeSourceConfig[]> {
-    await fs.mkdir(path.dirname(this.#file), { recursive: true })
+    await ensurePrivateDirectory(path.dirname(this.#file))
+    await ensurePrivateFile(this.#file)
     try {
       const raw = await fs.readFile(this.#file, 'utf8')
       const parsed: unknown = JSON.parse(raw)
@@ -29,10 +31,8 @@ export class KnowledgeSourceStore {
   }
 
   async save(sources: readonly KnowledgeSourceConfig[]): Promise<void> {
-    await fs.mkdir(path.dirname(this.#file), { recursive: true })
-    const temporary = `${this.#file}.tmp`
-    await fs.writeFile(temporary, JSON.stringify(sources, null, 2), 'utf8')
-    await fs.rename(temporary, this.#file)
+    await ensurePrivateDirectory(path.dirname(this.#file))
+    await writePrivateFile(this.#file, JSON.stringify(sources, null, 2))
   }
 }
 
@@ -43,6 +43,11 @@ function isKnowledgeSourceConfig(value: unknown): value is KnowledgeSourceConfig
     typeof source.name === 'string' && source.name.length > 0 &&
     typeof source.path === 'string' && source.path.length > 0 &&
     (source.kind === 'vault' || source.kind === 'folder') &&
+    (source.rootIdentity === undefined || (
+      typeof source.rootIdentity === 'object' && source.rootIdentity !== null &&
+      typeof (source.rootIdentity as Record<string, unknown>).dev === 'string' &&
+      typeof (source.rootIdentity as Record<string, unknown>).ino === 'string'
+    )) &&
     Array.isArray(source.include) && source.include.every((entry) => typeof entry === 'string') &&
     Array.isArray(source.exclude) && source.exclude.every((entry) => typeof entry === 'string')
 }

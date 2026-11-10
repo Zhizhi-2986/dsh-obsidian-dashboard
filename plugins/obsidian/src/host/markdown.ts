@@ -142,13 +142,16 @@ export function parseNote(markdown: string): ParsedNote {
     if (tag !== '' && !tags.includes(tag)) tags.push(tag)
   }
 
-  // Plain text: strip frontmatter, links, tags, markdown syntax.
-  let text = body
+  // Plain text for FTS: retain source line boundaries so search citations can
+  // point back to the original file, including when frontmatter is removed.
+  const frontmatterLineOffset = fmMatch?.[0].match(/\n/gu)?.length ?? 0
+  let text = `${'\n'.repeat(frontmatterLineOffset)}${body}`
     .replace(LINK_RE, '')
     .replace(HEADING_RE, ' ')
     .replace(/[#*_`>~|-]/gu, ' ')
-    .replace(/\s+/gu, ' ')
-    .trim()
+    .replace(/[\t\f\v ]+/gu, ' ')
+    .replace(/ *\n */gu, '\n')
+    .trimEnd()
 
   return { frontmatter, headings, tags, links: linkTargets, text }
 }

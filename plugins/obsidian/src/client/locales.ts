@@ -38,6 +38,44 @@ export type KnowledgeKey =
   | 'inboxConflicted'
   | 'inboxDismissed'
   | 'inboxConflict'
+  | 'inboxFilterAll'
+  | 'inboxFilterPending'
+  | 'inboxFinalContent'
+  | 'inboxBaselineDiff'
+  | 'inboxEditDraft'
+  | 'inboxSaveDraft'
+  | 'inboxCancelEdit'
+  | 'inboxApplyToFile'
+  | 'inboxConfirmTitle'
+  | 'inboxConfirmBody'
+  | 'inboxConfirmApply'
+  | 'inboxDraftSaveFailed'
+  | 'inboxCompareCurrent'
+  | 'inboxCurrentFile'
+  | 'inboxRevision'
+  | 'inboxConfirmationStale'
+  | 'inboxRebase'
+  | 'inboxCreateConflictChooseOperation'
+  | 'inboxRebaseCreateUpdate'
+  | 'inboxRebaseCreateAppend'
+  | 'inboxRebasedFrom'
+  | 'inboxAgent'
+  | 'inboxAgentUnknown'
+  | 'sourceRemoveConfirmTitle'
+  | 'sourceRemoveConfirmBody'
+  | 'sourceRemoveConfirmAction'
+  | 'sourceRemovePending'
+  | 'copyPath'
+  | 'copiedPath'
+  | 'copyPathFailed'
+  | 'copyCitation'
+  | 'copiedCitation'
+  | 'copyCitationFailed'
+  | 'matchLine'
+  | 'nativeOpenUnavailable'
+  | 'openInDsh'
+  | 'sourceSkipPolicy'
+  | 'sourceErrorHelp'
   | 'openFile'
   | 'tagsLabel'
   | 'linksLabel'
@@ -55,8 +93,7 @@ export type KnowledgeKey =
   | 'settingsPickDirectory'
   | 'settingsPickerFailed'
   | 'settingsPathHint'
-  | 'settingsInboxKeeDraft'
-  | 'settingsInboxKeepDraftHint'
+
 
 export const zhCN: Record<KnowledgeKey, string> = {
   panelLabel: '知识',
@@ -88,12 +125,50 @@ export const zhCN: Record<KnowledgeKey, string> = {
   inboxConflicted: '冲突',
   inboxDismissed: '已丢弃',
   inboxConflict: '写入冲突，请重新核对目标文件',
+  inboxFilterAll: '全部',
+  inboxFilterPending: '待审核',
+  inboxFinalContent: '最终内容预览',
+  inboxBaselineDiff: '与基线差异',
+  inboxEditDraft: '编辑草案',
+  inboxSaveDraft: '保存草案',
+  inboxCancelEdit: '取消编辑',
+  inboxApplyToFile: '应用到文件',
+  inboxConfirmTitle: '确认应用提案',
+  inboxConfirmBody: '请确认目标路径和将写入的内容。Host 会再次检查权限与文件版本。',
+  inboxConfirmApply: '确认应用到文件',
+  inboxDraftSaveFailed: '草案保存失败',
+  inboxCompareCurrent: '读取当前文件并比较',
+  inboxCurrentFile: '当前文件内容',
+  inboxRevision: '提案修订号',
+  inboxConfirmationStale: '提案内容在确认期间发生变化。请关闭确认框，重新检查并再次确认。',
+  inboxRebase: '以当前文件为基线新建提案',
+  inboxCreateConflictChooseOperation: '创建目标已存在，请选择后续提案类型：',
+  inboxRebaseCreateUpdate: '以当前文件为基线提出替换',
+  inboxRebaseCreateAppend: '以当前文件为基线提出追加',
+  inboxRebasedFrom: '基于冲突提案',
+  inboxAgent: 'Agent',
+  inboxAgentUnknown: '未知 Agent',
+  sourceRemoveConfirmTitle: '确认移除知识源',
+  sourceRemoveConfirmBody: '只会移除插件配置与索引，不会删除磁盘上的源文件。',
+  sourceRemoveConfirmAction: '确认移除来源',
+  sourceRemovePending: '该来源有待审核提案。移除后提案仍保留在收件箱，但将无法应用；建议先处理或丢弃。',
+  copyPath: '复制相对路径',
+  copiedPath: '路径已复制',
+  copyPathFailed: '无法访问剪贴板，请手动复制路径',
+  copyCitation: '复制引用',
+  copiedCitation: '引用已复制',
+  copyCitationFailed: '无法访问剪贴板，引用复制失败',
+  matchLine: '匹配行',
+  nativeOpenUnavailable: 'DSH 原生文件导航当前不可用，请打开一个会话后重试。',
+  openInDsh: '在 DSH 中打开原文',
+  sourceSkipPolicy: '索引 Markdown/TXT；忽略隐藏、版本控制和构建目录，以及配置的排除路径。',
+  sourceErrorHelp: '检查路径仍可访问且 DSH 有读取权限；修复后点「重新索引」。',
   openFile: '打开',
   tagsLabel: '标签',
   linksLabel: '出链',
   backlinksLabel: '反链',
   settingsTitle: '知识工作台',
-  settingsDescription: '知识源请在「知识」页面管理；此处仅配置收件箱行为。',
+  settingsDescription: '知识源请在「知识」页面管理。所有文件写入均需人工审阅，并由 Host 复核权限与文件版本。',
   settingsSourceName: '名称',
   settingsSourcePath: '路径',
   settingsSourceKind: '类型',
@@ -105,8 +180,6 @@ export const zhCN: Record<KnowledgeKey, string> = {
   settingsPickDirectory: '选择目录…',
   settingsPickerFailed: '无法打开目录选择器，请重试或手动输入完整路径。',
   settingsPathHint: '请选择文件夹，或手动输入文件夹的完整路径。',
-  settingsInboxKeeDraft: '写入冲突时保留草稿',
-  settingsInboxKeepDraftHint: '目标文件在提案后被修改时，将提案标记为冲突而非静默失败。',
 }
 
 export const enUS: Record<KnowledgeKey, string> = {
@@ -139,12 +212,50 @@ export const enUS: Record<KnowledgeKey, string> = {
   inboxConflicted: 'conflict',
   inboxDismissed: 'dismissed',
   inboxConflict: 'Write conflicted; re-check the target file before retrying',
+  inboxFilterAll: 'All',
+  inboxFilterPending: 'Pending review',
+  inboxFinalContent: 'Final content preview',
+  inboxBaselineDiff: 'Diff from baseline',
+  inboxEditDraft: 'Edit draft',
+  inboxSaveDraft: 'Save draft',
+  inboxCancelEdit: 'Cancel edit',
+  inboxApplyToFile: 'Apply to file',
+  inboxConfirmTitle: 'Confirm proposal application',
+  inboxConfirmBody: 'Confirm the target path and content. The Host will re-check permissions and the file version.',
+  inboxConfirmApply: 'Confirm apply to file',
+  inboxDraftSaveFailed: 'Could not save the draft',
+  inboxCompareCurrent: 'Load current file for comparison',
+  inboxCurrentFile: 'Current file content',
+  inboxRevision: 'Draft revision',
+  inboxConfirmationStale: 'The draft changed while confirmation was open. Close this dialog, review the latest draft, and confirm again.',
+  inboxRebase: 'Create a proposal from current baseline',
+  inboxCreateConflictChooseOperation: 'The create target now exists. Choose the follow-up proposal type:',
+  inboxRebaseCreateUpdate: 'Propose replacing from current file',
+  inboxRebaseCreateAppend: 'Propose appending to current file',
+  inboxRebasedFrom: 'Rebased from conflict',
+  inboxAgent: 'Agent ID',
+  inboxAgentUnknown: 'Unknown Agent',
+  sourceRemoveConfirmTitle: 'Remove knowledge source?',
+  sourceRemoveConfirmBody: 'This removes the plugin configuration and index only. Files on disk will not be deleted.',
+  sourceRemoveConfirmAction: 'Confirm remove source',
+  sourceRemovePending: 'This source has pending proposals. They will remain in Inbox but cannot be applied after removal; resolve or dismiss them first.',
+  copyPath: 'Copy relative path',
+  copiedPath: 'Path copied',
+  copyPathFailed: 'Clipboard unavailable; copy the path manually',
+  copyCitation: 'Copy citation',
+  copiedCitation: 'Citation copied',
+  copyCitationFailed: 'Could not access the clipboard',
+  matchLine: 'Line',
+  nativeOpenUnavailable: 'Native DSH file navigation is unavailable. Open a session and try again.',
+  openInDsh: 'Open original in DSH',
+  sourceSkipPolicy: 'Indexes Markdown/TXT; skips hidden, version-control, and build folders, plus configured exclusions.',
+  sourceErrorHelp: 'Check that the path exists and DSH can read it, then choose Reindex.',
   openFile: 'Open',
   tagsLabel: 'Tags',
   linksLabel: 'Links',
   backlinksLabel: 'Backlinks',
   settingsTitle: 'Knowledge Workbench',
-  settingsDescription: 'Manage knowledge sources in the Knowledge page; inbox behavior is configured here.',
+  settingsDescription: 'Manage knowledge sources in the Knowledge page. File writes always require review and Host permission/version checks.',
   settingsSourceName: 'Name',
   settingsSourcePath: 'Path',
   settingsSourceKind: 'Kind',
@@ -156,8 +267,6 @@ export const enUS: Record<KnowledgeKey, string> = {
   settingsPickDirectory: 'Choose folder…',
   settingsPickerFailed: 'Could not open the folder chooser. Try again or enter the full path manually.',
   settingsPathHint: 'Choose a folder or enter its full path manually.',
-  settingsInboxKeeDraft: 'Keep draft on write conflict',
-  settingsInboxKeepDraftHint: 'When the target changed after the proposal, mark the item conflicted instead of failing silently.',
 }
 
 export const dictionaries = {

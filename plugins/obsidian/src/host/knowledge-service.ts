@@ -15,81 +15,42 @@ import type { Context } from '@deepseek-ai/cordis'
 import { FsVersion, type FsTarget } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { MAX_SOURCES, type ObsidianSettings } from '../shared/settings-contract.ts'
+import { MAX_SOURCES, type KnowledgeSourceConfig, type ObsidianSettings, type SourceRootIdentity } from '../shared/settings-contract.ts'
 import {
   KNOWLEDGE_SERVICE, fail, isFailResult, MAX_INBOX_ITEMS,
   type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type FailResult, type InboxItem,
   type KnowledgeResult, type KnowledgeSourceInfo, type ListSourcesOk,
-  type ProposeInput, type ReadDoc, type SearchOk, type SearchOptions,
+  type ProposeInput, type ReadDoc, type RebaseOperation, type SearchOk, type SearchOptions,
   type SourceKind,
 } from '../shared/rpc-contract.ts'
 import { KnowledgeIndex } from './indexer.ts'
 import { KnowledgeSourceRuntime } from './knowledge-source.ts'
+import { resolveContainedFsTarget } from './fs-target.ts'
+import { resolveAgainstKnown } from './link-resolution.ts'
 import { digestNote } from './markdown.ts'
 import { fileStemOf } from './scanner.ts'
 import { InboxStore } from './inbox-store.ts'
+import { rebaseInboxProposal } from './inbox-rebase.ts'
+import { failure, errorMessage } from './failure.ts'
+import { withKeyedLock } from './keyed-lock.ts'
 import { KnowledgeSourceStore } from './source-store.ts'
-import { normalizeSourceRelPath, resolveContainedPath } from './source-path.ts'
+import { MAX_PROPOSAL_BASELINE_BYTES, decodeBoundedText, readHandleTextBounded } from './bounded-read.ts'
+import { assertUniqueSourceIds, sameSourceIndexingConfig } from './source-config.ts'
+import { captureSourceRootIdentity, normalizeSourceRelPath, resolveContainedPath, sourceRootIdentityMatches } from './source-path.ts'
+import { hasRootIdentity, sourceRootFailure } from './source-root.ts'
 
 const DEFAULT_SEARCH_LIMIT = 20
 const MAX_SEARCH_LIMIT = 100
 const MAX_QUERY_CHARS = 256
-
-function errorCode(error: unknown): string | undefined {
-  return typeof error === 'object' && error !== null && 'code' in error
-    ? String((error as { code: unknown }).code)
-    : undefined
-}
-
-function failure(error: unknown, fallback: FailResult): FailResult {
-  switch (errorCode(error)) {
-    case 'FS_NOT_FOUND': return fail('NOT_FOUND', 'path not found')
-    case 'FS_STALE_VERSION':
-    case 'FS_NOT_OBSERVED': return fail('CONFLICT', 'file changed on disk; reload it before saving')
-    case 'FS_SANDBOX_DENIED':
-    case 'FS_PERMISSION_DENIED': return fail('SANDBOX_DENIED',
-      'the workspace sandbox denied the write. If the target lives outside ' +
-      'the current workspace, switch to the workspace that contains it, or grant ' +
-      'the session a wider file-sandbox mode, then retry.')
-    case 'FS_TOO_LARGE': return fail('TOO_LARGE', 'file exceeds the size limit')
-    case 'FS_AMBIGUOUS_EDIT': return fail('CONFLICT', 'target resolution is ambiguous; reload it')
-    default: return fallback
-  }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-/** The installed rc.5 local fs backend uses the canonical absolute path as its
- *  stable target identity. Compare after resolve so later stat/read/write calls
- *  stay pinned to the checked identity even if a path is swapped concurrently. */
-function targetIsCanonical(target: FsTarget, expectedPath: string): boolean {
-  return String(target.targetKey) === expectedPath
-}
-
-function assertUniqueSourceIds(config: ObsidianSettings): void {
-  const sourceIds = config.knowledgeSources.map((source) => source.id)
-  if (new Set(sourceIds).size !== sourceIds.length) {
-    throw new Error('duplicate knowledge source ids in configuration')
-  }
-}
-
-function sameSourceIndexingConfig(left: ObsidianSettings['knowledgeSources'][number], right: ObsidianSettings['knowledgeSources'][number]): boolean {
-  return left.path === right.path && left.kind === right.kind &&
-    sameStrings(left.include, right.include) && sameStrings(left.exclude, right.exclude)
-}
-
-function sameStrings(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index])
-}
-
+const SOURCE_REMOVAL_CONFLICT_MESSAGE = 'knowledge source was removed; this proposal is retained but cannot be applied'
 export class KnowledgeService extends TypertRemoteService {
   /** Public because Cordis proxies forward service reads/writes through it. */
   context: Context
   #config: ObsidianSettings
   readonly #index: KnowledgeIndex
   readonly #runtimes = new Map<string, KnowledgeSourceRuntime>()
+  readonly #rootErrors = new Map<string, string>()
+  readonly #targetWrites = new Map<string, Promise<void>>()
   readonly #inboxStore: InboxStore
   readonly #sourceStore: KnowledgeSourceStore
   readonly #ready: Promise<void>
@@ -104,7 +65,24 @@ export class KnowledgeService extends TypertRemoteService {
     this.#index = KnowledgeIndex.open(path.join(dataDir, 'knowledge.db'))
     this.#inboxStore = new InboxStore(dataDir)
     this.#sourceStore = new KnowledgeSourceStore(dataDir)
-    this.#ready = this.#sourceStore.load(config.knowledgeSources).then(async (sources) => {
+    this.#ready = this.#sourceStore.load(config.knowledgeSources).then(async (loadedSources) => {
+      let sourcesChanged = false
+      const sources: KnowledgeSourceConfig[] = []
+      for (const source of loadedSources) {
+        if (hasRootIdentity(source.rootIdentity)) {
+          sources.push(source)
+          continue
+        }
+        try {
+          const pinned = await captureSourceRootIdentity(source.path)
+          sources.push({ ...source, path: pinned.path, rootIdentity: pinned.identity })
+          sourcesChanged = true
+        } catch (error) {
+          this.#rootErrors.set(source.id, errorMessage(error))
+          sources.push(source)
+        }
+      }
+      if (sourcesChanged) await this.#sourceStore.save(sources)
       assertUniqueSourceIds({ ...config, knowledgeSources: sources })
       await this.#applySettings({ ...config, knowledgeSources: sources })
     })
@@ -117,6 +95,8 @@ export class KnowledgeService extends TypertRemoteService {
     this.read = this.read.bind(this)
     this.proposeInbox = this.proposeInbox.bind(this)
     this.listInbox = this.listInbox.bind(this)
+    this.updateInboxDraft = this.updateInboxDraft.bind(this)
+    this.rebaseInbox = this.rebaseInbox.bind(this)
     this.applyInbox = this.applyInbox.bind(this)
     this.dismissInbox = this.dismissInbox.bind(this)
   }
@@ -158,32 +138,66 @@ export class KnowledgeService extends TypertRemoteService {
     }
 
     let sourcePath: string
+    let rootIdentity: Awaited<ReturnType<typeof captureSourceRootIdentity>>['identity']
     try {
-      const stat = await fs.stat(requestedPath)
-      if (!stat.isDirectory()) return fail('INVALID', 'knowledge source path must be a folder')
-      sourcePath = await fs.realpath(requestedPath)
+      const initialStat = await fs.stat(requestedPath)
+      if (!initialStat.isDirectory()) return fail('INVALID', 'knowledge source path must be a folder')
+      const pinned = await captureSourceRootIdentity(requestedPath)
+      sourcePath = pinned.path
+      rootIdentity = pinned.identity
     } catch (error) {
       return failure(error, fail('NOT_FOUND', 'knowledge source folder not found'))
     }
     signal?.throwIfAborted()
 
-    return this.#queueSettingsChange(async () => {
-      await this.#ready
-      signal?.throwIfAborted()
-      if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
-      const sources = this.#config.knowledgeSources
-      if (sources.length >= MAX_SOURCES) return fail('INVALID', `at most ${MAX_SOURCES} knowledge sources are allowed`)
-      if (sources.some((source) => path.resolve(source.path) === sourcePath)) {
-        return fail('ALREADY_EXISTS', 'this folder is already a knowledge source')
-      }
-      const source = {
-        id: randomUUID(), name, path: sourcePath, kind: input.kind, include: [], exclude: [],
-      } as const
-      const next = [...sources, source]
+    return this.#queueSettingsChange(() => this.#addPersistedSource(name, input.kind, sourcePath, rootIdentity, signal))
+  }
+
+  async #addPersistedSource(
+    name: string,
+    kind: SourceKind,
+    sourcePath: string,
+    rootIdentity: SourceRootIdentity,
+    signal?: AbortSignal,
+  ): Promise<KnowledgeResult<AddSourceOk>> {
+    await this.#ready
+    signal?.throwIfAborted()
+    if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
+    const sources = this.#config.knowledgeSources
+    try {
+      if (!await sourceRootIdentityMatches(sourcePath, rootIdentity)) return fail('OUTSIDE_SOURCE', 'knowledge source root changed while it was being added')
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to verify knowledge source root'))
+    }
+    if (sources.length >= MAX_SOURCES) return fail('INVALID', `at most ${MAX_SOURCES} knowledge sources are allowed`)
+    if (sources.some((source) => path.resolve(source.path) === sourcePath)) return fail('ALREADY_EXISTS', 'this folder is already a knowledge source')
+    const source = { id: randomUUID(), name, path: sourcePath, kind, include: [], exclude: [], rootIdentity } as const
+    const previousConfig = this.#config
+    const next = [...sources, source]
+    try {
       await this.#sourceStore.save(next)
-      await this.#applySettings({ ...this.#config, knowledgeSources: next })
-      return { ok: true, source: this.#infoOf(source.id) }
-    })
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to persist knowledge source'))
+    }
+    try {
+      await this.#applySettings({ ...previousConfig, knowledgeSources: next })
+    } catch (error) {
+      let restored = true
+      try {
+        await this.#sourceStore.save(sources)
+      } catch {
+        restored = false
+      }
+      try {
+        await this.#applySettings(previousConfig)
+      } catch {
+        restored = false
+      }
+      return failure(error, fail('IO', restored
+        ? 'failed to initialize knowledge source; addition was rolled back'
+        : 'source addition partially failed; reload the source list to reconcile state'))
+    }
+    return { ok: true, source: this.#infoOf(source.id) }
   }
 
   async removeKnowledgeSource(sourceId: string): Promise<KnowledgeResult<{ ok: true }>> {
@@ -192,9 +206,54 @@ export class KnowledgeService extends TypertRemoteService {
       await this.#ready
       if (this.#shuttingDown) return fail('IO', 'knowledge service is shutting down')
       if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
-      const next = this.#config.knowledgeSources.filter((source) => source.id !== sourceId)
-      await this.#sourceStore.save(next)
-      await this.#applySettings({ ...this.#config, knowledgeSources: next })
+      let items: InboxItem[]
+      try {
+        items = await this.#inboxStore.list()
+      } catch (error) {
+        return failure(error, fail('IO', 'failed to check pending proposals before removing source'))
+      }
+      const changedIds: string[] = []
+      for (const item of items) {
+        if (item.sourceId !== sourceId || item.status !== 'pending') continue
+        try {
+          if (await this.#markSourceProposalConflicted(item)) changedIds.push(item.id)
+        } catch (error) {
+          const restored = await this.#restoreSourceRemovalDrafts(sourceId, changedIds)
+          return failure(error, fail('IO', restored
+            ? 'failed to preserve proposal state; earlier proposal changes were restored'
+            : 'failed to preserve proposal state and could not restore every draft'))
+        }
+      }
+      const previousConfig = this.#config
+      const previousSources = previousConfig.knowledgeSources
+      const next = previousSources.filter((source) => source.id !== sourceId)
+      try {
+        await this.#sourceStore.save(next)
+      } catch (error) {
+        const restored = await this.#restoreSourceRemovalDrafts(sourceId, changedIds)
+        return failure(error, fail('IO', restored
+          ? 'failed to persist source removal; pending proposals were restored'
+          : 'failed to persist source removal and could not restore every pending proposal'))
+      }
+      try {
+        await this.#applySettings({ ...this.#config, knowledgeSources: next })
+      } catch (error) {
+        let restored = true
+        try {
+          await this.#sourceStore.save(previousSources)
+        } catch {
+          restored = false
+        }
+        try {
+          await this.#applySettings(previousConfig)
+        } catch {
+          restored = false
+        }
+        if (!await this.#restoreSourceRemovalDrafts(sourceId, changedIds)) restored = false
+        return failure(error, fail('IO', restored
+          ? 'failed to apply source removal; source and pending proposals were restored'
+          : 'source removal partially failed; reload sources and Inbox to reconcile state'))
+      }
       return { ok: true }
     })
   }
@@ -202,7 +261,7 @@ export class KnowledgeService extends TypertRemoteService {
   browseSource(sourceId: string, directoryPath = ''): KnowledgeResult<BrowseOk> {
     if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
     const relative = directoryPath === '' ? '' : normalizeSourceRelPath(directoryPath)
-    if (relative === null) return fail('INVALID', 'invalid or unsafe directory path')
+    if (relative === null) return fail('OUTSIDE_SOURCE', 'directory path is outside the configured source')
     const listing = this.#index.listDirectory(sourceId, relative)
     return { ok: true, sourceId, directoryPath: relative, ...listing }
   }
@@ -216,6 +275,13 @@ export class KnowledgeService extends TypertRemoteService {
     if (options.sourceId !== undefined && this.#sourceOf(options.sourceId) === null) {
       return fail('NOT_FOUND', 'unknown knowledge source')
     }
+    const selectedSources = options.sourceId === undefined
+      ? this.#config.knowledgeSources
+      : this.#config.knowledgeSources.filter((source) => source.id === options.sourceId)
+    for (const source of selectedSources) {
+      const rootFailure = await sourceRootFailure(source)
+      if (rootFailure !== null) return rootFailure
+    }
     const limit = Math.min(Math.max(options.limit ?? DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT)
     const field = options.field ?? 'body'
     const hits = this.#index.search(options.sourceId, field, trimmed, limit)
@@ -226,10 +292,19 @@ export class KnowledgeService extends TypertRemoteService {
     await this.#ready
     const source = this.#sourceOf(sourceId)
     if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) return rootFailure
     const relative = normalizeSourceRelPath(relPath)
-    if (relative === null) return fail('INVALID', 'invalid or unsafe path')
-    const absPath = await resolveContainedPath(source.path, relative)
-    if (absPath === null) return fail('INVALID', 'path resolves outside the configured source')
+    if (relative === null) return fail('OUTSIDE_SOURCE', 'document path is outside the configured source')
+    let absPath: string | null
+    try {
+      absPath = await resolveContainedPath(source.path, relative)
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to resolve document path'))
+    }
+    if (absPath === null) return fail('OUTSIDE_SOURCE', 'path resolves outside the configured source')
+    const rootStillPinned = await sourceRootFailure(source)
+    if (rootStillPinned !== null) return rootStillPinned
     signal?.throwIfAborted()
 
     let handle: Awaited<ReturnType<typeof fs.open>> | undefined
@@ -248,9 +323,12 @@ export class KnowledgeService extends TypertRemoteService {
         return fail('INVALID', 'target identity changed while resolving path')
       }
       signal?.throwIfAborted()
-      content = await handle.readFile({ encoding: 'utf8', signal })
-      if (content.length > 4 * 1024 * 1024) return fail('TOO_LARGE', 'document is too large to review here')
-      version = `${info.dev}:${info.ino}:${info.mtimeMs}:${info.size}`
+      content = await readHandleTextBounded(handle, MAX_PROPOSAL_BASELINE_BYTES, signal)
+      const afterRead = await handle.stat()
+      if (afterRead.dev !== info.dev || afterRead.ino !== info.ino || afterRead.mtimeMs !== info.mtimeMs || afterRead.size !== info.size) {
+        return fail('CONFLICT', 'file changed while it was being read; retry the read')
+      }
+      version = `${afterRead.dev}:${afterRead.ino}:${afterRead.mtimeMs}:${afterRead.size}`
     } catch (error) {
       return failure(error, fail('IO', 'failed to read file'))
     } finally {
@@ -279,57 +357,195 @@ export class KnowledgeService extends TypertRemoteService {
     }
   }
 
-  async propose(sourceId: string, input: ProposeInput, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+  async propose(sourceId: string, input: ProposeInput, signal?: AbortSignal, agentId: string | null = null): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    return this.#queueSettingsChange(() => this.#proposeWithSource(sourceId, input, signal, agentId))
+  }
+
+  async #proposeWithSource(sourceId: string, input: ProposeInput, signal?: AbortSignal, agentId: string | null = null): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
     await this.#ready
+    signal?.throwIfAborted()
     if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
     if (input.sourceId !== sourceId) return fail('INVALID', 'source mismatch')
     const relative = normalizeSourceRelPath(input.targetPath)
-    if (relative === null) return fail('INVALID', 'invalid or unsafe target path')
+    if (relative === null) return fail('OUTSIDE_SOURCE', 'target path is outside the configured source')
     const source = this.#sourceOf(sourceId)
     if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
-    const absPath = await resolveContainedPath(source.path, relative)
-    if (absPath === null) return fail('INVALID', 'target resolves outside the configured source')
-    const target = await this.context.fs.resolve(absPath)
-    const existing = await this.context.fs.stat(target, signal)
-    const baseVersion = existing === undefined || existing.type !== 'file' ? null : String(existing.version)
-    const item = await this.#inboxStore.add({ ...input, targetPath: relative })
-    const updated = await this.#inboxStore.update(item.id, { baseVersion })
-    return { ok: true, item: updated ?? item }
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) return rootFailure
+    let absPath: string | null
+    try {
+      absPath = await resolveContainedPath(source.path, relative)
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to resolve proposal target'))
+    }
+    if (absPath === null) return fail('OUTSIDE_SOURCE', 'target resolves outside the configured source')
+    const rootStillPinned = await sourceRootFailure(source)
+    if (rootStillPinned !== null) return rootStillPinned
+
+    let baselineContent = ''
+    let baseVersion: string | null = null
+    try {
+      const target = await resolveContainedFsTarget(this.context, source.path, absPath)
+      if (target === null) return fail('OUTSIDE_SOURCE', 'target is outside the configured source in the DSH filesystem')
+      const existing = await this.context.fs.stat(target, signal)
+      if (existing?.type === 'file') {
+        baseVersion = String(existing.version)
+        if (input.kind !== 'create') {
+          if (typeof existing.size === 'number' && existing.size > MAX_PROPOSAL_BASELINE_BYTES) {
+            return fail('TOO_LARGE', 'target file is too large to review')
+          }
+          const bytes = await this.context.fs.readBytes(target, signal, MAX_PROPOSAL_BASELINE_BYTES)
+          const decoded = decodeBoundedText(bytes)
+          if (decoded === null) return fail('INVALID', 'target is not valid UTF-8 text')
+          baselineContent = decoded
+          const confirmed = await this.context.fs.stat(target, signal)
+          if (confirmed?.type !== 'file' || String(confirmed.version) !== baseVersion) {
+            return fail('CONFLICT', 'target changed while capturing proposal baseline; retry proposal creation')
+          }
+        }
+      } else if (input.kind !== 'create') {
+        return fail('CONFLICT', 'append/update proposals require an existing readable target file')
+      }
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to capture proposal baseline'))
+    }
+
+    if (baselineContent.length > 4 * 1024 * 1024) return fail('TOO_LARGE', 'target file is too large to review')
+    signal?.throwIfAborted()
+    let item: InboxItem | null
+    try {
+      item = await this.#inboxStore.add({ ...input, targetPath: relative }, baselineContent, baseVersion, agentId)
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to persist proposal'))
+    }
+    if (item === null) return fail('TOO_LARGE', 'the inbox storage limit is reached; resolve old proposals before adding another')
+    return { ok: true, item }
+  }
+
+  async updateInboxDraftItem(itemId: string, body: string): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    if (typeof body !== 'string' || body.length > 200_000) return fail('INVALID', 'draft must be at most 200,000 characters')
+    let items: InboxItem[]
+    try {
+      items = await this.#inboxStore.list()
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to read inbox'))
+    }
+    const current = items.find((item) => item.id === itemId) ?? null
+    if (current === null) return fail('NOT_FOUND', 'proposal not found')
+    const key = `${current.sourceId}\u0000${current.targetPath}`
+    try {
+      return await withKeyedLock(this.#targetWrites, key, async () => {
+      const latestItems = await this.#inboxStore.list()
+      const latest = latestItems.find((item) => item.id === itemId) ?? null
+      if (latest === null) return fail('NOT_FOUND', 'proposal not found')
+      if (latest.status !== 'pending') return fail('CONFLICT', `proposal is already ${latest.status}`)
+        const item = await this.#inboxStore.update(itemId, { body, conflictMessage: null })
+        return item === null ? fail('NOT_FOUND', 'proposal not found') : { ok: true, item }
+      })
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to persist proposal draft'))
+    }
+  }
+
+  async rebaseInboxItem(itemId: string, operation: RebaseOperation = 'same', signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    return this.#queueSettingsChange(() => this.#rebaseInboxItem(itemId, operation, signal))
+  }
+
+  async #rebaseInboxItem(itemId: string, operation: RebaseOperation, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    return rebaseInboxProposal({
+      context: this.context,
+      ready: this.#ready,
+      inbox: this.#inboxStore,
+      sourceOf: (sourceId) => this.#sourceOf(sourceId),
+      sourceRootFailure,
+      withTargetLock: (key, task) => withKeyedLock(this.#targetWrites, key, task),
+    }, itemId, operation, signal)
   }
 
   async listInboxItems(): Promise<KnowledgeResult<{ ok: true; items: InboxItem[] }>> {
-    const items = await this.#inboxStore.list()
-    return { ok: true, items: items.slice(-MAX_INBOX_ITEMS) }
+    try {
+      const items = await this.#inboxStore.list()
+      return { ok: true, items: items.slice(-MAX_INBOX_ITEMS) }
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to read inbox'))
+    }
   }
 
-  async applyInboxItem(itemId: string, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
+  async applyInboxItem(itemId: string, expectedRevision: number, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 1) return fail('INVALID', 'a valid confirmation revision is required')
+    let items: InboxItem[]
+    try {
+      items = await this.#inboxStore.list()
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to read inbox'))
+    }
+    const item = items.find((entry) => entry.id === itemId) ?? null
+    if (item === null) return fail('NOT_FOUND', 'proposal not found')
+    if (item.revision !== expectedRevision) return fail('STALE_CONFIRMATION', 'proposal changed after confirmation; review it again')
+    const key = `${item.sourceId}\u0000${item.targetPath}`
+    try {
+      return await withKeyedLock(this.#targetWrites, key, () => this.#applyInboxItem(itemId, expectedRevision, signal))
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to apply proposal'))
+    }
+  }
+
+  async #applyInboxItem(itemId: string, expectedRevision: number, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
     await this.#ready
     const items = await this.#inboxStore.list()
     const item = items.find((entry) => entry.id === itemId) ?? null
     if (item === null) return fail('NOT_FOUND', 'proposal not found')
+    if (item.revision !== expectedRevision) return fail('STALE_CONFIRMATION', 'proposal changed after confirmation; review it again')
     if (item.status !== 'pending') return fail('CONFLICT', `proposal is already ${item.status}`)
     const source = this.#sourceOf(item.sourceId)
     if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) return rootFailure
     const relative = normalizeSourceRelPath(item.targetPath)
-    if (relative === null) return fail('INVALID', 'invalid or unsafe target path')
-    const absPath = await resolveContainedPath(source.path, relative)
-    if (absPath === null) return fail('INVALID', 'target resolves outside the configured source')
+    if (relative === null) return fail('OUTSIDE_SOURCE', 'target path is outside the configured source')
+    let absPath: string | null
+    try {
+      absPath = await resolveContainedPath(source.path, relative)
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to resolve proposal target'))
+    }
+    if (absPath === null) return fail('OUTSIDE_SOURCE', 'target resolves outside the configured source')
 
-    const target: FsTarget = await this.context.fs.resolve(absPath)
-    if (!targetIsCanonical(target, absPath)) return fail('INVALID', 'target identity changed while resolving path')
+    let target: FsTarget | null
+    try {
+      target = await resolveContainedFsTarget(this.context, source.path, absPath)
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to resolve target in the DSH filesystem'))
+    }
+    if (target === null) return fail('OUTSIDE_SOURCE', 'target is outside the configured source in the DSH filesystem')
 
     let content: string
     let intent: { kind: 'createIfAbsent' } | { kind: 'replaceIfVersion'; version: FsVersion }
     try {
       const info = await this.context.fs.stat(target, signal)
       if (item.kind === 'create') {
-        if (info !== undefined && info.type === 'file') return fail('CONFLICT', 'target file already exists')
+        if (info !== undefined && info.type === 'file') {
+          const message = 'target file already exists; review the current file before creating an update or append proposal'
+          await this.#inboxStore.update(item.id, { status: 'conflicted', conflictMessage: message })
+          return fail('CONFLICT', message)
+        }
         content = item.body
         intent = { kind: 'createIfAbsent' }
       } else {
         if (info === undefined || info.type !== 'file') return fail('CONFLICT', 'target file no longer exists; reload it')
-        const existing = await this.context.fs.readText(target, signal)
-        const base: FsVersion = FsVersion(item.baseVersion ?? String(info.version))
+        if (item.baseVersion === null) return fail('CONFLICT', 'proposal has no safe baseline; create a new proposal')
+        if (String(info.version) !== item.baseVersion) {
+          const message = 'file changed after this proposal was created; review a new baseline before applying'
+          await this.#inboxStore.update(item.id, { status: 'conflicted', conflictMessage: message })
+          return fail('CONFLICT', message)
+        }
+        if (typeof info.size === 'number' && info.size > MAX_PROPOSAL_BASELINE_BYTES) {
+          return fail('TOO_LARGE', 'target file is too large to review')
+        }
+        const currentBytes = await this.context.fs.readBytes(target, signal, MAX_PROPOSAL_BASELINE_BYTES)
+        const existing = decodeBoundedText(currentBytes)
+        if (existing === null) return fail('INVALID', 'target is not valid UTF-8 text')
+        const base: FsVersion = FsVersion(item.baseVersion)
         content = item.kind === 'append' ? `${existing.replace(/\s*$/u, '')}\n\n${item.body}\n` : item.body
         intent = { kind: 'replaceIfVersion', version: base }
       }
@@ -337,11 +553,52 @@ export class KnowledgeService extends TypertRemoteService {
       return failure(error, fail('IO', 'failed to read target'))
     }
 
+    let writeTarget: FsTarget
     try {
-      const outcome = await this.context.fs.writeText(target, content, intent, signal)
+      const rootStillPinned = await sourceRootFailure(source)
+      if (rootStillPinned !== null) return rootStillPinned
+      const currentAbsPath = await resolveContainedPath(source.path, relative)
+      if (currentAbsPath === null) return fail('OUTSIDE_SOURCE', 'target moved outside the configured source before writing')
+      if (currentAbsPath !== absPath) return fail('CONFLICT', 'target path changed while the proposal was being reviewed')
+      const currentTarget = await resolveContainedFsTarget(this.context, source.path, currentAbsPath)
+      if (currentTarget === null) return fail('OUTSIDE_SOURCE', 'target is outside the configured source in the DSH filesystem')
+      const currentInfo = await this.context.fs.stat(currentTarget, signal)
+      if (item.kind === 'create') {
+        if (currentInfo !== undefined && currentInfo.type === 'file') {
+          const message = 'target file already exists; review the current file before creating an update or append proposal'
+          await this.#inboxStore.update(item.id, { status: 'conflicted', conflictMessage: message })
+          return fail('CONFLICT', message)
+        }
+      } else if (currentInfo === undefined || currentInfo.type !== 'file' || String(currentInfo.version) !== item.baseVersion) {
+        const message = 'file changed after this proposal was created; review a new baseline before applying'
+        await this.#inboxStore.update(item.id, { status: 'conflicted', conflictMessage: message })
+        return fail('CONFLICT', message)
+      }
+      writeTarget = currentTarget
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to revalidate target before writing'))
+    }
+
+    try {
+      const outcome = await this.context.fs.writeText(writeTarget, content, intent, signal)
       const version = String(outcome.version)
-      await this.#inboxStore.update(item.id, { status: 'applied', baseVersion: version, conflictMessage: null })
-      return { ok: true, itemId: item.id, version }
+      let statusError: string | null = null
+      try {
+        const updated = await this.#inboxStore.update(item.id, { status: 'applied', baseVersion: version, conflictMessage: null })
+        if (updated === null) statusError = 'file was written but the proposal record no longer exists'
+      } catch (error) {
+        statusError = errorMessage(error)
+      }
+      let syncError: string | null = null
+      const runtime = this.#runtimes.get(item.sourceId)
+      if (runtime !== undefined) {
+        try {
+          await runtime.sync()
+        } catch (error) {
+          syncError = errorMessage(error)
+        }
+      }
+      return { ok: true, itemId: item.id, version, statusError, syncError }
     } catch (error) {
       const result = failure(error, fail('IO', 'write failed'))
       if (result.code === 'CONFLICT') {
@@ -352,9 +609,28 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   async dismissInboxItem(itemId: string): Promise<KnowledgeResult<{ ok: true }>> {
-    const item = await this.#inboxStore.update(itemId, { status: 'dismissed' })
-    if (item === null) return fail('NOT_FOUND', 'proposal not found')
-    return { ok: true }
+    let items: InboxItem[]
+    try {
+      items = await this.#inboxStore.list()
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to read inbox'))
+    }
+    const current = items.find((entry) => entry.id === itemId) ?? null
+    if (current === null) return fail('NOT_FOUND', 'proposal not found')
+    const key = `${current.sourceId}\u0000${current.targetPath}`
+    try {
+      return await withKeyedLock(this.#targetWrites, key, async () => {
+        const latestItems = await this.#inboxStore.list()
+        const latest = latestItems.find((entry) => entry.id === itemId) ?? null
+        if (latest === null) return fail('NOT_FOUND', 'proposal not found')
+        if (latest.status === 'applied') return fail('CONFLICT', 'applied proposals cannot be dismissed')
+        if (latest.status === 'dismissed') return { ok: true }
+        const item = await this.#inboxStore.update(itemId, { status: 'dismissed' })
+        return item === null ? fail('NOT_FOUND', 'proposal not found') : { ok: true }
+      })
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to update proposal status'))
+    }
   }
 
   // ── Typert RPC surface (profile-scoped knowledge) ──────────────────────────
@@ -363,6 +639,9 @@ export class KnowledgeService extends TypertRemoteService {
   async listSources(): Promise<KnowledgeResult<ListSourcesOk>> {
     await this.#ready
     await this.#settingsUpdates
+    for (const source of this.#config.knowledgeSources) {
+      await this.#ensureRuntime(source)
+    }
     return { ok: true, sources: this.listSourceInfos() }
   }
 
@@ -379,15 +658,20 @@ export class KnowledgeService extends TypertRemoteService {
   @Remote
   async browse(sourceId: string, directoryPath: string): Promise<KnowledgeResult<BrowseOk>> {
     await this.#ready
+    const source = this.#sourceOf(sourceId)
+    if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) return rootFailure
     return this.browseSource(sourceId, directoryPath)
   }
 
   @Remote
   async indexSource(sourceId: string): Promise<KnowledgeResult<AddSourceOk>> {
     await this.#ready
-    if (this.#sourceOf(sourceId) === null) return fail('NOT_FOUND', 'unknown knowledge source')
-    const runtime = this.#runtimes.get(sourceId)
-    if (runtime === undefined) return fail('NOT_FOUND', 'unknown knowledge source')
+    const source = this.#sourceOf(sourceId)
+    if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const runtime = await this.#ensureRuntime(source)
+    if (isFailResult(runtime)) return runtime
     try {
       await runtime.sync()
     } catch (error) {
@@ -417,8 +701,18 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   @Remote
-  async applyInbox(itemId: string, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
-    return this.applyInboxItem(itemId, signal)
+  async updateInboxDraft(itemId: string, body: string): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    return this.updateInboxDraftItem(itemId, body)
+  }
+
+  @Remote
+  async rebaseInbox(itemId: string, operation: RebaseOperation, signal?: AbortSignal): Promise<KnowledgeResult<{ ok: true; item: InboxItem }>> {
+    return this.rebaseInboxItem(itemId, operation, signal)
+  }
+
+  @Remote
+  async applyInbox(itemId: string, expectedRevision: number, signal?: AbortSignal): Promise<KnowledgeResult<ApplyOk>> {
+    return this.applyInboxItem(itemId, expectedRevision, signal)
   }
 
   @Remote
@@ -434,8 +728,62 @@ export class KnowledgeService extends TypertRemoteService {
     return task
   }
 
+  async #markSourceProposalConflicted(item: InboxItem): Promise<boolean> {
+    const key = `${item.sourceId}\u0000${item.targetPath}`
+    return withKeyedLock(this.#targetWrites, key, async () => {
+      const latestItems = await this.#inboxStore.list()
+      const latest = latestItems.find((entry) => entry.id === item.id) ?? null
+      if (latest?.status !== 'pending') return false
+      return await this.#inboxStore.update(item.id, {
+        status: 'conflicted', conflictMessage: SOURCE_REMOVAL_CONFLICT_MESSAGE,
+      }) !== null
+    })
+  }
+
+  async #restoreSourceRemovalDrafts(sourceId: string, changedIds: readonly string[]): Promise<boolean> {
+    let items: InboxItem[]
+    try {
+      items = await this.#inboxStore.list()
+    } catch {
+      return false
+    }
+    for (const id of changedIds) {
+      const item = items.find((entry) => entry.id === id && entry.sourceId === sourceId)
+      if (item === undefined) continue
+      const key = `${item.sourceId}\u0000${item.targetPath}`
+      try {
+        const restored = await withKeyedLock(this.#targetWrites, key, async () => {
+          const latestItems = await this.#inboxStore.list()
+          const latest = latestItems.find((entry) => entry.id === id) ?? null
+          if (latest?.status !== 'conflicted' || latest.conflictMessage !== SOURCE_REMOVAL_CONFLICT_MESSAGE) return true
+          return await this.#inboxStore.update(id, { status: 'pending', conflictMessage: null }) !== null
+        })
+        if (!restored) return false
+      } catch {
+        return false
+      }
+    }
+    return true
+  }
+
   #startRuntime(runtime: KnowledgeSourceRuntime): void {
     void runtime.sync().catch(() => undefined).finally(() => runtime.startWatch())
+  }
+
+  async #ensureRuntime(source: KnowledgeSourceConfig): Promise<KnowledgeSourceRuntime | FailResult> {
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) {
+      this.#rootErrors.set(source.id, rootFailure.message)
+      return rootFailure
+    }
+    this.#rootErrors.delete(source.id)
+    let runtime = this.#runtimes.get(source.id)
+    if (runtime === undefined) {
+      runtime = new KnowledgeSourceRuntime(source, this.#index)
+      this.#runtimes.set(source.id, runtime)
+      this.#startRuntime(runtime)
+    }
+    return runtime
   }
 
   async #applySettings(config: ObsidianSettings): Promise<void> {
@@ -456,6 +804,18 @@ export class KnowledgeService extends TypertRemoteService {
 
     this.#config = config
     for (const source of config.knowledgeSources) {
+      const rootFailure = await sourceRootFailure(source)
+      if (rootFailure !== null) {
+        this.#rootErrors.set(source.id, rootFailure.message)
+        const existingRuntime = this.#runtimes.get(source.id)
+        if (existingRuntime !== undefined) {
+          this.#runtimes.delete(source.id)
+          await existingRuntime.stop()
+        }
+        this.#index.clearSource(source.id)
+        continue
+      }
+      this.#rootErrors.delete(source.id)
       const previous = previousById.get(source.id)
       if (previous !== undefined && sameSourceIndexingConfig(previous, source) && this.#runtimes.has(source.id)) continue
       const runtime = new KnowledgeSourceRuntime(source, this.#index)
@@ -464,7 +824,7 @@ export class KnowledgeService extends TypertRemoteService {
     }
   }
 
-  #sourceOf(sourceId: string): { id: string; name: string; path: string; kind: SourceKind } | null {
+  #sourceOf(sourceId: string): KnowledgeSourceConfig | null {
     return this.#config.knowledgeSources.find((source) => source.id === sourceId) ?? null
   }
 
@@ -481,24 +841,9 @@ export class KnowledgeService extends TypertRemoteService {
       kind: source.kind,
       indexedAt: runtime?.state.indexedAt ?? null,
       fileCount: runtime?.state.fileCount ?? 0,
-      lastError: runtime?.state.lastError ?? null,
+      lastError: this.#rootErrors.get(sourceId) ?? runtime?.state.lastError ?? null,
     }
   }
-}
-
-function resolveAgainstKnown(target: string, alias: string | null, known: ReadonlySet<string>): string | null {
-  for (const candidate of [target, alias]) {
-    if (candidate === null) continue
-    const clean = candidate.trim()
-    if (clean === '' || clean.startsWith('#') || clean.startsWith('/')) continue
-    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/u.test(clean)) continue
-    const hash = clean.indexOf('#')
-    const withoutHeading = hash >= 0 ? clean.slice(0, hash) : clean
-    const withMd = withoutHeading.endsWith('.md') ? withoutHeading : `${withoutHeading}.md`
-    if (known.has(withMd)) return withMd
-    if (known.has(withoutHeading)) return withoutHeading
-  }
-  return null
 }
 
 export { isFailResult }
