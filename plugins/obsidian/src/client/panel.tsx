@@ -1,6 +1,6 @@
 /** Knowledge main panel: full-text search, document open, proposal inbox. */
 
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, useRef, type ReactElement } from 'react'
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, useRef, type FormEvent, type ReactElement } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SearchHit, SourceKind } from '../shared/rpc-contract.ts'
@@ -14,12 +14,12 @@ const PANEL_TABS = ['search', 'browse', 'sources', 'preview', 'inbox'] as const
 type PanelTab = (typeof PANEL_TABS)[number]
 
 const s = {
-  root: { display: 'flex', flexDirection: 'column' as const, height: '100%', minWidth: 0, fontFamily: 'inherit', fontSize: 13 },
-  header: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px 8px', borderBottom: '1px solid rgba(127,127,127,0.18)' },
-  tabs: { display: 'flex', gap: 2, padding: '8px 12px 0', borderBottom: '1px solid rgba(127,127,127,0.18)' },
+  root: { display: 'flex', flexDirection: 'column' as const, height: '100%', minWidth: 0, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif', fontSize: 13, letterSpacing: '-0.1px' },
+  header: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px 8px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 3%, transparent)' },
+  tabs: { display: 'flex', gap: 3, padding: '7px 14px 0', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' },
   tab: (active: boolean) => ({
-    padding: '5px 10px', borderRadius: 6, cursor: 'pointer', border: 'none', background: active ? 'rgba(127,127,127,0.22)' : 'transparent',
-    color: 'inherit', fontSize: 12, opacity: active ? 1 : 0.7,
+    padding: '5px 10px', borderRadius: 7, cursor: 'pointer', border: 'none', background: active ? 'color-mix(in srgb, currentColor 12%, transparent)' : 'transparent',
+    color: 'inherit', fontSize: 12, opacity: active ? 1 : 0.72, transition: 'background 120ms ease, opacity 120ms ease',
   }),
   searchRow: { display: 'flex', gap: 6, padding: '8px 12px', alignItems: 'center' },
   input: { flex: 1, minWidth: 0, padding: '6px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
@@ -32,8 +32,8 @@ const s = {
   tags: { display: 'flex', gap: 4, flexWrap: 'wrap' as const, marginTop: 4 },
   tag: { fontSize: 11, color: 'rgba(127,127,127,0.8)', padding: '1px 6px', borderRadius: 8, background: 'rgba(127,127,127,0.12)' },
   button: (tone: 'plain' | 'primary' | 'danger' = 'plain') => ({
-    padding: '4px 10px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', cursor: 'pointer', fontSize: 12,
-    background: tone === 'primary' ? 'rgba(68,120,255,0.85)' : tone === 'danger' ? 'rgba(210,70,70,0.75)' : 'transparent',
+    padding: '5px 11px', borderRadius: 7, border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', cursor: 'pointer', fontSize: 12,
+    background: tone === 'primary' ? '#3478f6' : tone === 'danger' ? '#d85b57' : 'color-mix(in srgb, currentColor 3%, transparent)',
     color: tone === 'plain' ? 'inherit' : '#fff', opacity: 1,
   }),
   empty: { color: 'rgba(127,127,127,0.7)', padding: '24px 8px', textAlign: 'center' as const, fontSize: 12 },
@@ -47,8 +47,13 @@ const s = {
   sourceLabel: { display: 'flex', flexDirection: 'column' as const, gap: 4, fontSize: 12, color: 'rgba(127,127,127,0.85)' },
   sourceInput: { padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
   previewToolbar: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.14)' },
+  previewScreen: { display: 'flex', flexDirection: 'column' as const, flex: 1, minHeight: 0, minWidth: 0 },
   previewContent: { margin: 0, padding: 16, whiteSpace: 'pre-wrap' as const, overflowWrap: 'anywhere' as const, lineHeight: 1.65, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 },
   footer: { padding: '7px 12px', borderTop: '1px solid rgba(127,127,127,0.18)', color: 'rgba(127,127,127,0.75)', fontSize: 11, display: 'flex', gap: 12, flexWrap: 'wrap' as const },
+  workspace: { display: 'flex', flexDirection: 'column' as const, flex: 1, minHeight: 0 },
+  sidebar: { minHeight: 38, display: 'flex', flexDirection: 'row' as const, alignItems: 'center', gap: 3, padding: '5px 12px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 3%, transparent)' },
+  sidebarLabel: { padding: '0 9px 7px', fontSize: 10, color: 'rgba(127,127,127,.85)', fontWeight: 650, letterSpacing: '.45px', textTransform: 'uppercase' as const },
+  sidebarNav: (active: boolean) => ({ display: 'flex', alignItems: 'center', gap: 9, padding: '6px 10px', border: 0, borderRadius: 7, cursor: 'pointer', textAlign: 'left' as const, font: 'inherit', fontSize: 12, color: 'inherit', background: active ? 'color-mix(in srgb, currentColor 12%, transparent)' : 'transparent', fontWeight: active ? 600 : 400, whiteSpace: 'nowrap' as const }),
 }
 
 const KIND_TONE: Record<InboxItem['kind'], string> = { create: '#8fd08a', append: '#d0b98f', update: '#8fb4d0' }
@@ -143,6 +148,14 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   const [browseLoading, setBrowseLoading] = useState(false)
   const [browseError, setBrowseError] = useState<string | null>(null)
   const [previewDocument, setPreviewDocument] = useState<ReadDoc | null>(null)
+  const [editingDocument, setEditingDocument] = useState(false)
+  const [editContent, setEditContent] = useState('')
+  const [savingDocument, setSavingDocument] = useState(false)
+  const [newNoteTitle, setNewNoteTitle] = useState('')
+  const [newNoteTarget, setNewNoteTarget] = useState<{ sourceId: string; directoryPath: string } | null>(null)
+  const [newNoteDirectoryPath, setNewNoteDirectoryPath] = useState('')
+  const [newNoteDialogOpen, setNewNoteDialogOpen] = useState(false)
+  const [newNoteDialogError, setNewNoteDialogError] = useState<string | null>(null)
   const [pendingHeadingFragment, setPendingHeadingFragment] = useState<string | null>(null)
   const [previewReturnTab, setPreviewReturnTab] = useState<'search' | 'browse'>('search')
   const [sources, setSources] = useState<KnowledgeSourceInfo[]>([])
@@ -311,7 +324,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   }, [tab])
 
   useEffect(() => {
-    if (tab !== 'preview' || previewDocument === null || pendingHeadingFragment === null) return
+    if (!['preview', 'browse'].includes(tab) || previewDocument === null || pendingHeadingFragment === null) return
     const headingId = slugHeading(pendingHeadingFragment)
     const article = panelRootRef.current?.querySelector('.dsh-obsidian-markdown') ?? null
     const heading = article === null
@@ -375,12 +388,15 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   }, [tab, browseSelection, browsePath, selectedBrowseSource?.indexedAt, selectedBrowseSource?.lastError, rpc])
 
   const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string, headingFragment?: string): Promise<void> => {
+    if (editingDocument && previewDocument && editContent !== previewDocument.content && !window.confirm('Discard unsaved note changes?')) return
     const requestId = ++documentReadSequence.current
     setOpenError(null)
     try {
       const result = await rpc.read(source.id, relPath)
       if (requestId !== documentReadSequence.current) return
       if (result.ok) {
+        setEditingDocument(false)
+        setEditContent(result.content)
         const returnTab = tab === 'browse' ? 'browse' : tab === 'preview' ? previewReturnTab : 'search'
         setPreviewReturnTab(returnTab)
         setPreviewDocument(result)
@@ -402,6 +418,114 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     } catch {
       setCopyFeedback(t('copyPathFailed'))
     }
+  }
+
+  const saveDocument = async (): Promise<void> => {
+    if (!previewDocument || savingDocument) return
+    const title = newNoteTitle.trim()
+    const targetPath = previewDocument.path || `${newNoteDirectoryPath ? `${newNoteDirectoryPath}/` : ''}${title}.md`
+    if (previewDocument.version === '' && (title === '' || title.includes('/') || title.includes('\\'))) {
+      setOpenError('Enter a note title without path separators.')
+      return
+    }
+    setSavingDocument(true)
+    setOpenError(null)
+    try {
+      const result = await rpc.saveDocument({
+        sourceId: previewDocument.sourceId,
+        path: targetPath,
+        content: editContent,
+        expectedVersion: previewDocument.version || null,
+        expectedContent: previewDocument.version ? previewDocument.content : null,
+      })
+      if (!result.ok) {
+        if (active.toLowerCase().startsWith('zh') && result.code === 'SANDBOX_DENIED') {
+          setOpenError('此知识源未获得 DSH 写入授权，请在 DSH 允许写入的目录中添加该知识源。')
+        } else if (active.toLowerCase().startsWith('zh') && result.code === 'READ_ONLY') {
+          setOpenError('DSH 当前为只读模式，请允许工作区写入后再保存。')
+        } else if (active.toLowerCase().startsWith('zh') && result.code === 'CONFLICT') {
+          setOpenError('笔记正文在编辑期间发生了变化。当前草稿仍保留，请复制后重新打开笔记，比较内容再保存。')
+        } else {
+          setOpenError(result.message)
+        }
+        return
+      }
+      setPreviewDocument({ ...previewDocument, path: targetPath, title: previewDocument.path ? previewDocument.title : title, content: editContent, version: result.version, tags: [], links: [] })
+      setEditingDocument(false)
+      setNewNoteTitle('')
+      setNewNoteDirectoryPath('')
+      let refreshError: string | null = null
+      try {
+        const refreshed = await rpc.read(previewDocument.sourceId, targetPath)
+        if (refreshed.ok) setPreviewDocument(refreshed)
+        else refreshError = refreshed.message
+      } catch (error) {
+        refreshError = error instanceof Error ? error.message : String(error)
+      }
+      await refreshSources()
+      if (refreshError || result.syncError) {
+        const messages = [refreshError ? `refresh failed: ${refreshError}` : null, result.syncError ? `indexing failed: ${result.syncError}` : null].filter(Boolean)
+        setOpenError(`Saved, but ${messages.join('; ')}`)
+      }
+    } catch (error) {
+      setOpenError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSavingDocument(false)
+    }
+  }
+
+  const startNewNote = (): void => {
+    if (editingDocument && (editContent !== (previewDocument?.content ?? '') || newNoteTitle.trim() !== '') && !window.confirm('Discard unsaved note changes?')) return
+    const source = sources.find((entry) => entry.id === browseSelection)
+    if (!source) { setSourceError('Select a knowledge source before creating a note.'); return }
+    setNewNoteTitle('')
+    setNewNoteDialogError(null)
+    setNewNoteTarget({ sourceId: source.id, directoryPath: browsePath })
+    setNewNoteDialogOpen(true)
+  }
+
+  const cancelNewNoteDialog = (): void => {
+    setNewNoteDialogOpen(false)
+    setNewNoteTarget(null)
+    setNewNoteTitle('')
+    setNewNoteDirectoryPath('')
+    setNewNoteDialogError(null)
+  }
+
+  const confirmNewNoteDialog = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault()
+    const title = newNoteTitle.trim()
+    if (title === '' || title.includes('/') || title.includes('\\')) {
+      setNewNoteDialogError(t('newNoteTitleInvalid'))
+      return
+    }
+    if (!newNoteTarget) return
+    const targetPath = `${newNoteTarget.directoryPath ? `${newNoteTarget.directoryPath}/` : ''}${title}.md`
+    if (targetPath.length > 1024) {
+      setNewNoteDialogError(t('newNoteTitleTooLong'))
+      return
+    }
+    setPreviewDocument({ ok: true, sourceId: newNoteTarget.sourceId, path: '', content: '', version: '', title, tags: [], links: [], backlinks: [], updatedAt: null })
+    setPreviewReturnTab('browse')
+    setNewNoteDirectoryPath(newNoteTarget.directoryPath)
+    setEditContent('')
+    setEditingDocument(true)
+    setTab('preview')
+    setNewNoteDialogOpen(false)
+    setNewNoteTarget(null)
+    setNewNoteDialogError(null)
+  }
+
+  const switchTab = (nextTab: PanelTab): void => {
+    if (editingDocument) {
+      if ((editContent !== (previewDocument?.content ?? '') || newNoteTitle.trim() !== '') && !window.confirm('Discard unsaved note changes?')) return
+      setEditingDocument(false)
+      setEditContent('')
+      setNewNoteTitle('')
+      setNewNoteDirectoryPath('')
+      if (previewDocument?.path === '') setPreviewDocument(null)
+    }
+    setTab(nextTab)
   }
 
   const citationFor = (hit: SearchHit, source?: KnowledgeSourceInfo): string => {
@@ -618,22 +742,41 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   }
 
   return (
-    <div ref={panelRootRef} style={s.root}>
+    <div ref={panelRootRef} className="knowledge-panel" style={s.root}>
+      <style>{`
+        .knowledge-panel{container-type:inline-size;container-name:knowledgePanel}
+        .knowledge-sidebar>div:first-child{display:none}
+        .knowledge-sidebar>div:last-child{margin-left:auto!important;margin-top:0!important;padding:0!important;border:0!important}
+        .knowledge-file-row{min-width:0;flex-wrap:wrap}
+        @container knowledgePanel (max-width:520px){
+          .knowledge-browse-toolbar{display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;gap:6px!important;padding:8px!important}
+          .knowledge-browse-toolbar select{min-width:0!important;max-width:none!important}
+          .knowledge-browse-toolbar>span{display:none}
+          .knowledge-browse-toolbar button{white-space:nowrap;padding:5px 8px!important}
+          .knowledge-file-row{gap:5px!important;padding:8px!important}
+          .knowledge-file-row>div{flex:1 1 100%!important}
+          .knowledge-file-row button{padding:4px 7px!important;font-size:11px!important}
+          .knowledge-search-row{flex-wrap:wrap}
+          .knowledge-search-row input{flex-basis:100%}
+        }
+      `}</style>
       <div style={s.header}>
         <span style={{ fontWeight: 600, fontSize: 13 }}>{t('panelLabel')}</span>
         <div style={{ flex: 1 }} />
-        <button style={s.tab(tab === 'search')} onClick={() => setTab('search')}>{t('searchResults')}</button>
-        <button style={s.tab(tab === 'browse')} onClick={() => setTab('browse')}>{t('browseLabel')}</button>
-        {previewDocument ? <button style={s.tab(tab === 'preview')} onClick={() => setTab('preview')}>{t('previewLabel')}</button> : null}
-        <button style={s.tab(tab === 'sources')} onClick={() => setTab('sources')}>{t('sourcesLabel')}</button>
-        <button style={s.tab(tab === 'inbox')} onClick={() => setTab('inbox')}>
-          {t('inboxLabel')}{pendingCount > 0 ? ` (${pendingCount})` : ''}
-        </button>
+        <button style={s.button()} disabled={savingDocument} onClick={() => switchTab('sources')}>{t('sourcesLabel')}</button>
       </div>
+      <div className="knowledge-workspace" style={s.workspace}>
+        <aside className="knowledge-sidebar" style={s.sidebar}>
+          <div className="knowledge-sidebar-label" style={s.sidebarLabel}>工作区</div>
+          <button style={s.sidebarNav(tab === 'search')} disabled={savingDocument} onClick={() => switchTab('search')}>{t('searchResults')}</button>
+          <button style={s.sidebarNav(tab === 'browse' || tab === 'preview')} disabled={savingDocument} onClick={() => switchTab('browse')}>{t('browseLabel')}</button>
+          <button style={s.sidebarNav(tab === 'inbox')} disabled={savingDocument} onClick={() => switchTab('inbox')}>{t('inboxLabel')} {pendingCount > 0 ? `· ${pendingCount}` : ''}</button>
+        </aside>
+        <main style={{ minWidth: 0, minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column' }}>
 
       {tab === 'search' ? (
         <>
-          <div style={s.searchRow}>
+          <div className="knowledge-search-row" style={s.searchRow}>
             <input
               style={s.input}
               value={query}
@@ -680,33 +823,41 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
           </div>
         </>
       ) : tab === 'preview' ? (
-        <>
+        <div style={s.previewScreen}>
           <div style={s.previewToolbar}>
-            <button style={s.button()} onClick={() => setTab(previewReturnTab)}>{t('previewBack')}</button>
+            <button style={s.button()} disabled={savingDocument} onClick={() => switchTab(previewReturnTab)}>{t('previewBack')}</button>
             {previewDocument ? (
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 600 }}>{previewDocument.title}</div>
                 <div style={s.hitMeta}>{previewDocument.sourceId} · {previewDocument.path}</div>
               </div>
             ) : null}
-            {previewDocument ? <button type="button" style={s.button()} onClick={() => {
-              const source = sources.find((entry) => entry.id === previewDocument.sourceId)
-              if (source) openNativeFile(source, previewDocument.path, null)
-            }}>{t('openInDsh')}</button> : null}
             {previewDocument ? <button type="button" style={s.button()} onClick={() => void copyPreviewPath()}>{t('copyPath')}</button> : null}
+            {!editingDocument && previewDocument?.path ? <button type="button" style={s.button()} onClick={() => { setEditContent(previewDocument.content); setEditingDocument(true) }}>编辑笔记</button> : null}
+            {editingDocument ? <button type="button" style={s.button()} disabled={savingDocument} onClick={() => {
+              if ((editContent !== (previewDocument?.content ?? '') || newNoteTitle.trim() !== '') && !window.confirm('Discard unsaved note changes?')) return
+              setEditingDocument(false)
+              setEditContent(previewDocument?.content ?? '')
+              setNewNoteTitle('')
+              setNewNoteDirectoryPath('')
+              if (previewDocument?.path === '') { setPreviewDocument(null); setTab(previewReturnTab) }
+            }}>取消</button> : null}
+            {editingDocument ? <button type="button" style={s.button('primary')} disabled={savingDocument} onClick={() => void saveDocument()}>{savingDocument ? '保存中…' : '保存'}</button> : null}
           </div>
           {copyFeedback ? <div role="status" style={s.hitMeta}>{copyFeedback}</div> : null}
           {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
           {previewDocument?.tags.length ? (
             <div style={s.tags}>{previewDocument.tags.map((tag) => <span key={tag} style={s.tag}>#{tag}</span>)}</div>
           ) : null}
-          <div style={{ ...s.body, padding: 0 }}>
-            {previewDocument ? <MarkdownView content={previewDocument.content} links={previewDocument.links} onNavigate={(path, fragment) => void openLinkedDocument(path, fragment)} /> : null}
+          <div style={{ ...s.body, padding: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+            {editingDocument ? <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0, padding: 16 }}>
+              <textarea aria-label="Markdown note content" value={editContent} readOnly={savingDocument} onChange={(event) => setEditContent(event.target.value)} autoFocus={previewDocument?.version !== ''} style={{ flex: 1, minHeight: 0, width: '100%', resize: 'none', border: '1px solid rgba(127,127,127,.2)', borderRadius: 8, padding: 16, background: 'transparent', color: 'inherit', font: '13px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace' }} />
+            </div> : previewDocument ? <MarkdownView content={previewDocument.content} links={previewDocument.links} onNavigate={(path, fragment) => void openLinkedDocument(path, fragment)} /> : null}
           </div>
-        </>
+        </div>
       ) : tab === 'browse' ? (
-        <>
-          <div style={s.browseToolbar}>
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
+          <div className="knowledge-browse-toolbar" style={s.browseToolbar}>
             <select
               style={s.select}
               value={browseSelection}
@@ -715,7 +866,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
               <option value="">{t('browseSelectSource')}</option>
               {sources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
             </select>
-            {browseResult ? <span style={s.hitMeta}>{browseResult.documents.length} · {browseResult.directoryPath || '/'}</span> : null}
+            <button style={s.button('primary')} onClick={startNewNote}>＋ {t('newNoteTitleDialog')}</button>
           </div>
           {browseResult ? (
             <div style={s.breadcrumb}>
@@ -761,7 +912,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                   const source = sources.find((entry) => entry.id === document.sourceId)
                   const canOpen = source !== undefined
                   return (
-                    <div key={`doc:${document.path}`} style={s.row}>
+                    <div key={`doc:${document.path}`} className="knowledge-file-row" style={s.row}>
                       <span aria-hidden>▤</span>
                       <div style={{ flex: 1, minWidth: 0 }}>
                         <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{document.title}</div>
@@ -769,7 +920,6 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                       </div>
                       {canOpen && source ? <>
                         <button style={s.button()} onClick={() => void readAndPreviewDocument(source, document.path)}>{t('openFile')}</button>
-                        <button style={s.button()} onClick={() => openNativeFile(source, document.path, null)}>{t('openInDsh')}</button>
                       </> : null}
                     </div>
                   )
@@ -777,7 +927,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
               </>
             ) : null}
           </div>
-        </>
+        </div>
       ) : tab === 'sources' ? (
         <div style={s.body}>
           <div style={{ maxWidth: 760, margin: '0 auto' }}>
@@ -912,6 +1062,9 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
         </div>
       )}
 
+        </main>
+      </div>
+
       {confirmingItem ? (
         <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', padding: 18, background: 'rgba(20,24,30,0.45)' }}>
           <section role="dialog" aria-modal="true" aria-labelledby="proposal-confirm-title" style={{ maxWidth: 480, width: '100%', padding: 20, borderRadius: 10, background: 'var(--dsh-color-background, #fff)', color: 'var(--dsh-color-text, #222)', boxShadow: '0 12px 40px rgba(0,0,0,0.2)' }}>
@@ -943,6 +1096,30 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
               <button type="button" style={s.button('danger')} disabled={busyIds.has(confirmingSource.id)} onClick={() => void removeSource(confirmingSource)}>{t('sourceRemoveConfirmAction')}</button>
             </div>
           </section>
+        </div>
+      ) : null}
+
+      {newNoteDialogOpen && newNoteTarget ? (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1100, display: 'grid', placeItems: 'center', padding: 18, background: 'rgba(20,24,30,0.42)', backdropFilter: 'blur(3px)' }}>
+          <form role="dialog" aria-modal="true" aria-labelledby="new-note-title-dialog" onSubmit={confirmNewNoteDialog} onKeyDown={(event) => {
+            if (event.key === 'Escape') { event.preventDefault(); cancelNewNoteDialog(); return }
+            if (event.key !== 'Tab') return
+            const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('input, button:not(:disabled)'))
+            const first = controls[0]
+            const last = controls.at(-1)
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+            else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+          }} style={{ maxWidth: 420, width: '100%', padding: 22, borderRadius: 12, background: 'var(--dsh-color-background, #fff)', color: 'var(--dsh-color-text, #222)', boxShadow: '0 16px 48px rgba(0,0,0,0.22)', border: '1px solid color-mix(in srgb, currentColor 12%, transparent)' }}>
+            <h2 id="new-note-title-dialog" style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 650 }}>{t('newNoteTitleDialog')}</h2>
+            <p style={{ margin: '0 0 16px', ...s.hitMeta }}>{newNoteTarget.sourceId}{newNoteTarget.directoryPath ? ` · ${newNoteTarget.directoryPath}` : ''}</p>
+            <label htmlFor="new-note-title-input" style={{ display: 'block', marginBottom: 7, fontSize: 12, fontWeight: 600 }}>{t('newNoteTitleLabel')}</label>
+            <input id="new-note-title-input" autoFocus style={{ ...s.input, boxSizing: 'border-box', width: '100%', padding: '9px 11px', borderRadius: 8 }} placeholder={t('newNoteTitlePlaceholder')} value={newNoteTitle} onChange={(event) => { setNewNoteTitle(event.target.value); setNewNoteDialogError(null) }} />
+            {newNoteDialogError ? <div role="alert" style={{ ...s.empty, padding: '9px 0', textAlign: 'left' }}>{newNoteDialogError}</div> : null}
+            <div style={{ display: 'flex', justifyContent: 'end', gap: 8, marginTop: 20 }}>
+              <button type="button" style={s.button()} onClick={cancelNewNoteDialog}>{t('inboxCancelEdit')}</button>
+              <button type="submit" style={s.button('primary')}>{t('newNoteContinue')}</button>
+            </div>
+          </form>
         </div>
       ) : null}
 

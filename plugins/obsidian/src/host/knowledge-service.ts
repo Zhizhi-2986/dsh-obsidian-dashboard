@@ -21,7 +21,7 @@ import {
   type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type FailResult, type InboxItem,
   type KnowledgeResult, type KnowledgeSourceInfo, type ListSourcesOk,
   type ProposeInput, type ReadDoc, type RebaseOperation, type SearchOk, type SearchOptions,
-  type SourceKind,
+  type SourceKind, type SaveDocumentInput, type SaveDocumentOk,
 } from '../shared/rpc-contract.ts'
 import { KnowledgeIndex } from './indexer.ts'
 import { KnowledgeSourceRuntime } from './knowledge-source.ts'
@@ -93,6 +93,7 @@ export class KnowledgeService extends TypertRemoteService {
     this.indexSource = this.indexSource.bind(this)
     this.search = this.search.bind(this)
     this.read = this.read.bind(this)
+    this.saveDocument = this.saveDocument.bind(this)
     this.proposeInbox = this.proposeInbox.bind(this)
     this.listInbox = this.listInbox.bind(this)
     this.updateInboxDraft = this.updateInboxDraft.bind(this)
@@ -303,6 +304,19 @@ export class KnowledgeService extends TypertRemoteService {
       return failure(error, fail('IO', 'failed to resolve document path'))
     }
     if (absPath === null) return fail('OUTSIDE_SOURCE', 'path resolves outside the configured source')
+    let dshTarget: FsTarget | null = null
+    let initialFsVersion: string | null = null
+    if (this.context.fs !== undefined) {
+      try {
+        dshTarget = await resolveContainedFsTarget(this.context, source.path, absPath)
+        if (dshTarget === null) return fail('OUTSIDE_SOURCE', 'document is outside the configured source in the DSH filesystem')
+        const info = await this.context.fs.stat(dshTarget, signal)
+        if (info === undefined || info.type !== 'file') return fail('NOT_FOUND', 'file not found')
+        initialFsVersion = String(info.version)
+      } catch (error) {
+        return failure(error, fail('IO', 'failed to resolve document in the DSH filesystem'))
+      }
+    }
     const rootStillPinned = await sourceRootFailure(source)
     if (rootStillPinned !== null) return rootStillPinned
     signal?.throwIfAborted()
@@ -328,7 +342,15 @@ export class KnowledgeService extends TypertRemoteService {
       if (afterRead.dev !== info.dev || afterRead.ino !== info.ino || afterRead.mtimeMs !== info.mtimeMs || afterRead.size !== info.size) {
         return fail('CONFLICT', 'file changed while it was being read; retry the read')
       }
-      version = `${afterRead.dev}:${afterRead.ino}:${afterRead.mtimeMs}:${afterRead.size}`
+      if (dshTarget !== null && initialFsVersion !== null) {
+        const currentFsInfo = await this.context.fs.stat(dshTarget, signal)
+        if (currentFsInfo === undefined || currentFsInfo.type !== 'file' || String(currentFsInfo.version) !== initialFsVersion) {
+          return fail('CONFLICT', 'file changed while it was being read; retry the read')
+        }
+        version = initialFsVersion
+      } else {
+        version = `${afterRead.dev}:${afterRead.ino}:${afterRead.mtimeMs}:${afterRead.size}`
+      }
     } catch (error) {
       return failure(error, fail('IO', 'failed to read file'))
     } finally {
@@ -688,6 +710,73 @@ export class KnowledgeService extends TypertRemoteService {
   @Remote
   async read(sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadDoc>> {
     return this.readSource(sourceId, relPath, signal)
+  }
+
+  @Remote
+  async saveDocument(input: SaveDocumentInput, signal?: AbortSignal): Promise<KnowledgeResult<SaveDocumentOk>> {
+    await this.#ready
+    signal?.throwIfAborted()
+    const sandboxPolicy = this.context.sandboxPolicy.resolve()
+    const source = this.#sourceOf(input.sourceId)
+    if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const relative = normalizeSourceRelPath(input.path)
+    if (relative === null || !relative.toLowerCase().endsWith('.md')) return fail('INVALID', 'save path must be a Markdown file inside the source')
+    if (input.content.includes('\u0000')) return fail('INVALID', 'note content contains a null character')
+    if (Buffer.byteLength(input.content, 'utf8') > MAX_PROPOSAL_BASELINE_BYTES) return fail('TOO_LARGE', 'note content exceeds the 4 MiB limit')
+    const rootFailure = await sourceRootFailure(source)
+    if (rootFailure !== null) return rootFailure
+    const absPath = await resolveContainedPath(source.path, relative)
+    if (absPath === null) return fail('OUTSIDE_SOURCE', 'target resolves outside the configured source')
+    try {
+      return await withKeyedLock(this.#targetWrites, `${source.id}\u0000${relative}`, async () => {
+        const target = await resolveContainedFsTarget(this.context, source.path, absPath)
+        if (target === null) return fail('OUTSIDE_SOURCE', 'target is outside the configured source in the DSH filesystem')
+        const before = await this.context.fs.stat(target, signal)
+        let intent: { kind: 'createIfAbsent' } | { kind: 'replaceIfVersion'; version: FsVersion }
+        let expectedVersion = input.expectedVersion
+        if (input.expectedVersion === null) {
+          if (input.expectedContent !== null) return fail('INVALID', 'new notes cannot have baseline content')
+          if (before !== undefined) return fail('ALREADY_EXISTS', 'a file already exists at this path')
+          intent = { kind: 'createIfAbsent' }
+        } else {
+          if (before === undefined || before.type !== 'file') return fail('NOT_FOUND', 'note no longer exists')
+          if (input.expectedContent === null) return fail('INVALID', 'editing an existing note requires its baseline content')
+          expectedVersion = input.expectedVersion
+          if (String(before.version) !== expectedVersion) {
+            if (typeof before.size === 'number' && before.size > MAX_PROPOSAL_BASELINE_BYTES) return fail('TOO_LARGE', 'note is too large to compare safely')
+            const currentBytes = await this.context.fs.readBytes(target, signal, MAX_PROPOSAL_BASELINE_BYTES)
+            const currentContent = decodeBoundedText(currentBytes)
+            if (currentContent === null) return fail('INVALID', 'note is not valid UTF-8 text')
+            const confirmed = await this.context.fs.stat(target, signal)
+            if (confirmed?.type !== 'file' || String(confirmed.version) !== String(before.version)) {
+              return fail('CONFLICT', 'note changed while checking its content; reload it before saving')
+            }
+            if (currentContent !== input.expectedContent) return fail('CONFLICT', 'note content changed since it was opened; compare the current note before saving')
+            expectedVersion = String(before.version)
+          }
+          intent = { kind: 'replaceIfVersion', version: FsVersion(expectedVersion) }
+        }
+        const rootStillPinned = await sourceRootFailure(source)
+        if (rootStillPinned !== null) return rootStillPinned
+        const currentPath = await resolveContainedPath(source.path, relative)
+        if (currentPath !== absPath) return fail('CONFLICT', 'target path changed while saving')
+        const currentTarget = await resolveContainedFsTarget(this.context, source.path, currentPath)
+        if (currentTarget === null) return fail('OUTSIDE_SOURCE', 'target is outside the configured source in the DSH filesystem')
+        const current = await this.context.fs.stat(currentTarget, signal)
+        if (input.expectedVersion === null ? current !== undefined : current === undefined || String(current.version) !== expectedVersion) {
+          return fail('CONFLICT', 'note changed while saving; reload it before saving')
+        }
+        const written = await this.context.fs.writeText(currentTarget, input.content, intent, signal, sandboxPolicy)
+        let syncError: string | null = null
+        const runtime = this.#runtimes.get(source.id)
+        if (runtime !== undefined) {
+          try { await runtime.sync() } catch (error) { syncError = errorMessage(error) }
+        }
+        return { ok: true, version: String(written.version), syncError }
+      })
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to save note'))
+    }
   }
 
   @Remote

@@ -21,6 +21,12 @@ export type KnowledgeKey =
   | 'browseLoading'
   | 'browseUp'
   | 'browseFailed'
+  | 'newNoteTitleDialog'
+  | 'newNoteTitleLabel'
+  | 'newNoteTitlePlaceholder'
+  | 'newNoteTitleInvalid'
+  | 'newNoteTitleTooLong'
+  | 'newNoteContinue'
   | 'previewLabel'
   | 'previewBack'
   | 'sourcesLabel'
@@ -108,6 +114,12 @@ export const zhCN: Record<KnowledgeKey, string> = {
   browseLoading: '正在读取目录…',
   browseUp: '上级目录',
   browseFailed: '读取目录失败',
+  newNoteTitleDialog: '新建笔记',
+  newNoteTitleLabel: '标题',
+  newNoteTitlePlaceholder: '输入笔记标题',
+  newNoteTitleInvalid: '请输入有效标题，且不能包含斜杠。',
+  newNoteTitleTooLong: '当前目录下的文件路径过长，请缩短标题或返回上级目录。',
+  newNoteContinue: '继续编辑',
   previewLabel: '预览',
   previewBack: '返回',
   sourcesLabel: '知识源',
@@ -195,6 +207,12 @@ export const enUS: Record<KnowledgeKey, string> = {
   browseLoading: 'Loading folder…',
   browseUp: 'Parent folder',
   browseFailed: 'Could not read this folder',
+  newNoteTitleDialog: 'New note',
+  newNoteTitleLabel: 'Title',
+  newNoteTitlePlaceholder: 'Enter a note title',
+  newNoteTitleInvalid: 'Enter a valid title without slash characters.',
+  newNoteTitleTooLong: 'The file path is too long. Shorten the title or return to a parent folder.',
+  newNoteContinue: 'Continue editing',
   previewLabel: 'Preview',
   previewBack: 'Back',
   sourcesLabel: 'Knowledge sources',

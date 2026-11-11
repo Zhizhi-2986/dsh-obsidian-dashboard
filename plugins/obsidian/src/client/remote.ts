@@ -9,6 +9,7 @@ import {
   type FailResult, type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type InboxItem, type RebaseOperation,
   type KnowledgeSourceInfo, type ListSourcesOk, type ReadDoc,
   type SearchOk, type SearchOptions,
+  type SaveDocumentInput, type SaveDocumentOk,
 } from '../shared/rpc-contract.ts'
 
 const Str = z.string()
@@ -75,6 +76,8 @@ const ReadDocSchema = z.object({
   backlinks: z.array(DocLinkSchema),
   updatedAt: z.number().nullable(),
 })
+const SaveDocumentInputSchema = z.object({ sourceId: Str, path: RelPath, content: Str.max(4_194_304), expectedVersion: Str.nullable(), expectedContent: Str.max(4_194_304).nullable() }).strict()
+const SaveDocumentOkSchema = z.object({ ok: z.literal(true), version: Str, syncError: Str.nullable() })
 const ProposeInputSchema = z.object({
   kind: z.enum(['create', 'append', 'update']),
   title: Str.min(1).max(120),
@@ -109,6 +112,7 @@ const BrowseResultSchema = z.union([BrowseOkSchema, FailResultSchema])
 const AddSourceResultSchema = z.union([AddSourceOkSchema, FailResultSchema])
 const SearchResultSchema = z.union([SearchOkSchema, FailResultSchema])
 const ReadResultSchema = z.union([ReadDocSchema, FailResultSchema])
+const SaveDocumentResultSchema = z.union([SaveDocumentOkSchema, FailResultSchema])
 const ProposeResultSchema = z.union([ProposeOkSchema, FailResultSchema])
 const InboxListResultSchema = z.union([InboxListOkSchema, FailResultSchema])
 const ApplyResultSchema = z.union([ApplyOkSchema, FailResultSchema])
@@ -158,6 +162,7 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
     invocation('indexSource', [strParam('sourceId', QualifiedName)], resultCodec(AddSourceResultSchema, 'AddSourceResult'), true),
     invocation('search', [strParam('query', Str.max(256)), typedParam('options', SearchOptionsSchema, 'SearchOptions')], resultCodec(SearchResultSchema, 'SearchResult'), true),
     invocation('read', [strParam('sourceId', QualifiedName), strParam('relPath', RelPath)], resultCodec(ReadResultSchema, 'ReadResult'), true),
+    invocation('saveDocument', [typedParam('input', SaveDocumentInputSchema, 'SaveDocumentInput')], resultCodec(SaveDocumentResultSchema, 'SaveDocumentResult'), true),
     invocation('proposeInbox', [typedParam('input', ProposeInputSchema, 'ProposeInput')], resultCodec(ProposeResultSchema, 'ProposeResult'), true),
     invocation('listInbox', [], resultCodec(InboxListResultSchema, 'InboxListResult')),
     invocation('updateInboxDraft', [strParam('itemId', QualifiedName), strParam('body', Str.max(200_000))], resultCodec(ProposeResultSchema, 'ProposeResult')),
@@ -177,6 +182,7 @@ export interface KnowledgeRpc {
   indexSource(sourceId: string, signal?: AbortSignal): Promise<AddSourceOk | FailResult>
   search(query: string, options?: SearchOptions, signal?: AbortSignal): Promise<SearchOk | FailResult>
   read(sourceId: string, relPath: string, signal?: AbortSignal): Promise<ReadDoc | FailResult>
+  saveDocument(input: SaveDocumentInput, signal?: AbortSignal): Promise<SaveDocumentOk | FailResult>
   proposeInbox(input: {
     kind: 'create' | 'append' | 'update'
     title: string
@@ -223,6 +229,7 @@ export function knowledgeRpcOf(ctx: { readonly remote: unknown }): KnowledgeRpc 
     indexSource: async (sourceId, signal) => await invoke<AddSourceOk>('indexSource', sourceId, signal),
     search: async (query, options = {}, signal) => await invoke<SearchOk>('search', query, options, signal),
     read: async (sourceId, relPath, signal) => await invoke<ReadDoc>('read', sourceId, relPath, signal),
+    saveDocument: async (input, signal) => await invoke<SaveDocumentOk>('saveDocument', input, signal),
     proposeInbox: async (input) => await invoke<{ ok: true; item: InboxItem }>('proposeInbox', input),
     listInbox: async () => await invoke<{ ok: true; items: InboxItem[] }>('listInbox'),
     updateInboxDraft: async (itemId, body) => await invoke<{ ok: true; item: InboxItem }>('updateInboxDraft', itemId, body),

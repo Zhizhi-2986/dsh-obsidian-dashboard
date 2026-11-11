@@ -114,6 +114,69 @@ function changeTextArea(document, value) {
   Simulate.change(textarea, { target: { value } })
 }
 
+test('manual save does not require a session and preserves the draft while saving', async () => {
+  let savedInput
+  let finishSave
+  let content = '# Before'
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    browse: async (sourceId) => ({ ok: true, sourceId, directoryPath: '', directories: [], documents: [{ sourceId, path: 'note.md', title: 'Note', tags: [], updatedAt: 1 }] }),
+    read: async (sourceId, path) => ({ ok: true, sourceId, path, content, version: 'v1', title: 'Note', tags: [], links: [], backlinks: [], updatedAt: 1 }),
+    saveDocument: async (input) => {
+      savedInput = input
+      return await new Promise((resolve) => { finishSave = () => { content = input.content; resolve({ ok: true, version: 'v2', syncError: null }) } })
+    },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => clickButton(document, 'Browse'))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    await act(async () => clickButton(document, 'Open'))
+    await act(async () => clickButton(document, '编辑笔记'))
+    await act(async () => changeTextArea(document, '# After'))
+    await act(async () => clickButton(document, '保存'))
+    assert.equal(document.querySelector('textarea').readOnly, true)
+    assert.equal([...document.querySelectorAll('button')].find((button) => button.textContent.trim() === '取消').disabled, true)
+    await act(async () => { finishSave(); await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.equal('sessionId' in savedInput, false)
+    assert.equal(savedInput.content, '# After')
+    assert.equal(document.querySelector('textarea'), null)
+  }, {
+    sidebarRight: { mounted: { getSnapshot: () => undefined } },
+  })
+})
+
+test('a successful save keeps its new version when refreshing the preview throws', async () => {
+  let readCount = 0
+  const saves = []
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    browse: async (sourceId) => ({ ok: true, sourceId, directoryPath: '', directories: [], documents: [{ sourceId, path: 'note.md', title: 'Note', tags: [], updatedAt: 1 }] }),
+    read: async (sourceId, path) => {
+      readCount += 1
+      if (readCount === 2) throw new Error('refresh unavailable')
+      return { ok: true, sourceId, path, content: readCount === 1 ? '# Before' : '# Second', version: readCount === 1 ? 'v1' : 'v3', title: 'Note', tags: [], links: [], backlinks: [], updatedAt: 1 }
+    },
+    saveDocument: async (input) => { saves.push(input); return { ok: true, version: saves.length === 1 ? 'v2' : 'v3', syncError: null } },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => clickButton(document, 'Browse'))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
+    await act(async () => clickButton(document, 'Open'))
+    await act(async () => clickButton(document, '编辑笔记'))
+    await act(async () => changeTextArea(document, '# First'))
+    await act(async () => { clickButton(document, '保存'); await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.equal(Boolean(document.querySelector('textarea')), false, 'a completed write returns to preview even when refresh fails')
+    assert.match(document.body.textContent, /refresh unavailable/)
+    await act(async () => clickButton(document, '编辑笔记'))
+    await act(async () => changeTextArea(document, '# Second'))
+    await act(async () => { clickButton(document, '保存'); await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.equal(saves[1].expectedVersion, 'v2')
+    assert.equal(saves[1].expectedContent, '# First')
+  })
+})
+
 test('source manager exposes a manual reindex action and refreshes the displayed status', async () => {
   const indexedSources = []
   const rpc = {
@@ -199,7 +262,7 @@ test('removing a knowledge source requires confirmation and explains files remai
   })
 })
 
-test('Wikilink navigation preserves the Browse return location', async () => {
+test('Wikilink navigation stays in Browse and updates the inline note preview', async () => {
   const rpc = {
     listSources: async () => ({ ok: true, sources: [source] }),
     listInbox: async () => ({ ok: true, items: [] }),
@@ -219,8 +282,7 @@ test('Wikilink navigation preserves the Browse return location', async () => {
     assert.ok(wiki)
     await act(async () => wiki.dispatchEvent(new document.defaultView.MouseEvent('click', { bubbles: true })))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
-    await act(async () => clickButton(document, 'Back'))
-    assert.match(document.body.textContent, /notes\/start\.md/)
+    assert.match(document.body.textContent, /notes\/next\.md/)
   })
 })
 

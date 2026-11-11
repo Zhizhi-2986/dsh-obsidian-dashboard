@@ -144,6 +144,18 @@ export const ReadDocSchema = z.object({
 })
 export type ReadDoc = z.infer<typeof ReadDocSchema>
 
+export const SaveDocumentInputSchema = z.object({
+  sourceId: z.string(),
+  path: z.string().min(1).max(1024),
+  content: z.string().max(4_194_304),
+  expectedVersion: z.string().nullable(),
+  expectedContent: z.string().max(4_194_304).nullable(),
+}).strict()
+export type SaveDocumentInput = z.infer<typeof SaveDocumentInputSchema>
+
+export const SaveDocumentOkSchema = z.object({ ok: z.literal(true), version: z.string(), syncError: z.string().nullable() })
+export type SaveDocumentOk = z.infer<typeof SaveDocumentOkSchema>
+
 // ── Proposal inbox (review-before-write) ─────────────────────────────────────
 
 export const PROPOSAL_KINDS = ['create', 'append', 'update'] as const

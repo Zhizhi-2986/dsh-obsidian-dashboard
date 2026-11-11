@@ -32,6 +32,92 @@ async function withTempDir(run) {
   }
 }
 
+test('manual save uses agentless policy and honors the allowed knowledge directory', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    await writeFile(join(sourcePath, 'note.md'), '# Before')
+    const canonicalSource = await realpath(sourcePath)
+    const policy = { mode: 'workspace-write', workspaceRoot: join(root, 'other-workspace'), additionalWritableRoots: [canonicalSource] }
+    let isAllowed = false
+    let actualPolicy
+    const context = new Context()
+    context.sandboxPolicy = { resolve: (request) => { assert.equal(request, undefined); return isAllowed ? policy : { ...policy, additionalWritableRoots: [] } } }
+    context.fs = {
+      async resolve(path) { return { targetKey: path } },
+      contains() { return true },
+      async stat() { return { type: 'file', version: 'v1' } },
+      async writeText(target, content, intent, signal, writePolicy) {
+        assert.equal(intent.kind, 'replaceIfVersion')
+        assert.equal(String(intent.version), 'v1')
+        actualPolicy = writePolicy
+        if (![writePolicy.workspaceRoot, ...writePolicy.additionalWritableRoots].some((rootPath) => target.targetKey.startsWith(`${rootPath}/`))) throw Object.assign(new Error('outside workspace'), { code: 'FS_SANDBOX_DENIED' })
+        await writeFile(target.targetKey, content)
+        return { version: 'v2' }
+      },
+    }
+    const service = new KnowledgeService(context, {
+      ...defaults(), knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }],
+    }, join(root, 'plugin-data'))
+    try {
+      const input = { sourceId: 'vault', path: 'note.md', content: '# After', expectedVersion: 'v1', expectedContent: '# Before' }
+      const outside = await service.saveDocument(input)
+      assert.equal(outside.code, 'SANDBOX_DENIED')
+      assert.equal(await readFile(join(sourcePath, 'note.md'), 'utf8'), '# Before')
+      isAllowed = true
+      const saved = await service.saveDocument(input)
+      assert.equal(saved.ok, true)
+      assert.equal(actualPolicy, policy)
+      assert.equal(await readFile(join(sourcePath, 'note.md'), 'utf8'), '# After')
+    } finally {
+      await service.shutdown()
+    }
+  })
+})
+
+test('manual save accepts metadata-only version changes but rejects changed note content', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    await writeFile(join(sourcePath, 'note.md'), 'baseline')
+    let currentContent = 'baseline'
+    let currentVersion = 'v2'
+    let writeIntent
+    const policy = { mode: 'workspace-write', workspaceRoot: root, additionalWritableRoots: [] }
+    const context = new Context()
+    context.sandboxPolicy = { resolve: () => policy }
+    context.fs = {
+      async resolve(path) { return { targetKey: path } },
+      contains() { return true },
+      async stat() { return { type: 'file', version: currentVersion, size: Buffer.byteLength(currentContent) } },
+      async readBytes() { return textBytes(currentContent) },
+      async writeText(_target, content, intent) {
+        writeIntent = intent
+        currentContent = content
+        currentVersion = 'v3'
+        return { version: currentVersion }
+      },
+    }
+    const service = new KnowledgeService(context, {
+      ...defaults(), knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }],
+    }, join(root, 'plugin-data'))
+    try {
+      const saved = await service.saveDocument({ sourceId: 'vault', path: 'note.md', content: 'edited', expectedVersion: 'v1', expectedContent: 'baseline' })
+      assert.equal(saved.ok, true)
+      assert.equal(String(writeIntent.version), 'v2')
+
+      currentVersion = 'v4'
+      currentContent = 'external edit'
+      const conflicted = await service.saveDocument({ sourceId: 'vault', path: 'note.md', content: 'my edit', expectedVersion: 'v3', expectedContent: 'edited' })
+      assert.equal(conflicted.ok, false)
+      if (!conflicted.ok) assert.equal(conflicted.code, 'CONFLICT')
+      assert.equal(currentContent, 'external edit')
+    } finally {
+      await service.shutdown()
+    }
+  })
+})
+
 test('host settings reader unwraps the Volatile values returned by rc.5 Config', () => {
   const parsed = ObsidianConfig['~standard'].validate({ inbox: { keepDraftOnConflict: false } })
   assert.equal('issues' in parsed, false)
