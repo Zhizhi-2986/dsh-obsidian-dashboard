@@ -15,7 +15,7 @@ import { MAX_INBOX_ITEMS, SOURCE_KINDS, type KnowledgeSourceKind } from './const
 export { MAX_INBOX_ITEMS }
 export type SourceKind = KnowledgeSourceKind
 
-export const PKG = 'dsh-obsidian'
+export const PKG = 'dsh-obsidian-dashboard'
 export const KNOWLEDGE_SERVICE = 'knowledge'
 export const NS = 'dsh-obsidian'
 

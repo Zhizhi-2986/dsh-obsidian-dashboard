@@ -5,4 +5,4 @@
 # - Client half: `sidebar.panellist` entry `knowledge` + root `main` keyed panel.
 - insert:
     - id: dsh-obsidian
-      name: 'dsh-obsidian'
+      name: 'dsh-obsidian-dashboard'

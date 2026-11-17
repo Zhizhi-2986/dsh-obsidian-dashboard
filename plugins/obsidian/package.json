@@ -1,5 +1,5 @@
 {
-  "name": "dsh-obsidian",
+  "name": "dsh-obsidian-dashboard",
   "description": "Native knowledge workspace for DeepSeek Harness Desktop: dual knowledge sources, local full-text search, Wikilinks, and a review-before-write proposal inbox.",
   "version": "0.1.0",
   "type": "module",
@@ -52,6 +52,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && tsdown",
+    "prepack": "pnpm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.json && node --experimental-strip-types --test test/*.test.mjs"
   },
@@ -68,6 +69,9 @@
     "lib/types/**/*.d.mts",
     "cordis.patch.yml"
   ],
+  "dependencies": {
+    "zod": "4.4.3"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
     "@deepseek-ai/dsh-api-remotes": "*",

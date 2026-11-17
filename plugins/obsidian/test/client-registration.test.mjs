@@ -4,6 +4,7 @@ import { apply } from '../lib/client/index.js'
 import { TYPERT_REMOTE, knowledgeRpcOf } from '../src/client/remote.ts'
 
 test('profile-scoped knowledge RPCs do not require an active Session lookup', () => {
+  assert.equal(TYPERT_REMOTE.package, 'dsh-obsidian-dashboard')
   const browse = TYPERT_REMOTE.descriptors.find((entry) => entry.method === 'browse')
   assert.ok(browse)
   assert.deepEqual(browse.parameters.map((parameter) => parameter.name), ['sourceId', 'directoryPath'])
@@ -65,5 +66,5 @@ test('mounts RPC namespace before registering Knowledge client UI', async () => 
   remoteCtx = { ...ctx, remote: { knowledge: {} } }
   await apply(ctx)
   assert.equal(injectedKnowledgeNamespace, true)
-  assert.ok(registrations.some(({ options }) => options.name === 'plugins.bundle.config' && options.key === 'dsh-obsidian'))
+  assert.ok(registrations.some(({ options }) => options.name === 'plugins.bundle.config' && options.key === 'dsh-obsidian-dashboard'))
 })

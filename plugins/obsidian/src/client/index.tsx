@@ -19,6 +19,7 @@ import { dictionaries, NS } from './locales.ts'
 import { KnowledgeIcon, KnowledgePanelView, knowledgeT } from './panel.tsx'
 import { KnowledgeSettingsCard } from './settings-card.tsx'
 import type { ObsidianSettings } from '../shared/settings-contract.ts'
+import { PKG } from '../shared/rpc-contract.ts'
 
 export const inject = [
   'slots',
@@ -60,9 +61,9 @@ export async function apply(ctx: ClientContext): Promise<void> {
         return formCtx.configForms.whileServed([NS], () => formCtx.slots.inject('plugins.bundle.config', () => formCtx.slots.register(
           {
             name: 'plugins.bundle.config',
-            key: 'dsh-obsidian',
+            key: PKG,
             locale: NS,
-            registrant: 'dsh-obsidian',
+            registrant: PKG,
           },
           (props) => <KnowledgeSettingsCard scope={settings} {...props} />,
         )))
