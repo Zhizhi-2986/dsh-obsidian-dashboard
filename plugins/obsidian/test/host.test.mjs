@@ -518,6 +518,113 @@ test('SQLite index initializes a fresh plugin data directory', async () => {
   })
 })
 
+test('search finds Chinese substrings in the requested fields and preserves matching line', () => {
+  const index = KnowledgeIndex.open(':memory:')
+  try {
+    index.upsertDoc('vault', 'plan.md', '项目管理方案', ['知识管理'], '前言\n这是知识检索的设计。', 1)
+    index.upsertDoc('other', 'other.md', '知识检索', [], '知识检索', 1)
+    assert.deepEqual(index.search('vault', 'title', '项目', 10).map((hit) => hit.path), ['plan.md'])
+    assert.deepEqual(index.search('vault', 'tags', '知识', 10).map((hit) => hit.path), ['plan.md'])
+    const hits = index.search('vault', 'body', '知识检索', 10)
+    assert.equal(hits[0].line, 2)
+    assert.match(hits[0].snippet, /⟦知识检索⟧/)
+    assert.equal(index.search('vault', 'title', '检索', 10).length, 0)
+    assert.deepEqual(index.search('vault', 'all', '项目 design', 10).map((hit) => hit.path), ['plan.md'])
+  } finally { index.close() }
+})
+
+test('search ranks complete title matches ahead of body and partial multiword matches', () => {
+  const index = KnowledgeIndex.open(':memory:')
+  try {
+    index.upsertDoc('vault', 'partial.md', 'Other', [], 'project', 1)
+    index.upsertDoc('vault', 'body.md', 'Other', [], 'project planning guide', 1)
+    index.upsertDoc('vault', 'title.md', 'Project planning', [], 'notes', 1)
+    assert.deepEqual(index.search('vault', 'all', 'project planning', 10).map((hit) => hit.path), ['title.md', 'body.md', 'partial.md'])
+    index.upsertDoc('vault', 'title-single.md', 'Project', [], 'nothing here', 1)
+    index.upsertDoc('vault', 'body-repeat.md', 'Other', [], 'project project project project', 1)
+    assert.equal(index.search('vault', 'all', 'project', 10)[0].path, 'title-single.md')
+  } finally { index.close() }
+})
+
+test('knowledge service indexes and searches Chinese text from a source', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    await writeFile(join(sourcePath, 'plan.md'), '# 项目管理方案\n\n这是知识检索的设计。')
+    const service = new KnowledgeService(new Context(), {
+      ...defaults(), knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }],
+    }, join(root, 'plugin-data'))
+    try {
+      assert.equal((await service.indexSource('vault')).ok, true)
+      const result = await service.searchSources('知识检索', { sourceId: 'vault', field: 'all' })
+      assert.equal(result.ok, true)
+      assert.equal(result.hits[0].path, 'plan.md')
+      assert.equal(result.hits[0].line, 3)
+    } finally { await service.shutdown() }
+  })
+})
+
+test('search truncation reflects whether additional results exist', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    await writeFile(join(sourcePath, 'one.md'), '# Shared keyword')
+    await writeFile(join(sourcePath, 'two.md'), '# Shared keyword')
+    const service = new KnowledgeService(new Context(), { ...defaults(), knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }] }, join(root, 'data'))
+    try {
+      assert.equal((await service.indexSource('vault')).ok, true)
+      const exact = await service.searchSources('shared', { sourceId: 'vault', field: 'title', limit: 2 })
+      assert.equal(exact.truncated, false)
+      const limited = await service.searchSources('shared', { sourceId: 'vault', field: 'title', limit: 1 })
+      assert.equal(limited.hits.length, 1)
+      assert.equal(limited.truncated, true)
+    } finally { await service.shutdown() }
+  })
+})
+
+test('index runtime reports active synchronization and records errors', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    const index = KnowledgeIndex.open(':memory:')
+    const runtime = new KnowledgeSourceRuntime({ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }, index)
+    try {
+      const sync = runtime.sync()
+      assert.equal(runtime.isIndexing, true)
+      await sync
+      assert.equal(runtime.isIndexing, false)
+      assert.equal(typeof runtime.state.indexedAt, 'number')
+      await rm(sourcePath, { recursive: true })
+      await assert.rejects(runtime.sync())
+      assert.equal(runtime.isIndexing, false)
+      assert.ok(runtime.state.lastError)
+    } finally { await runtime.stop(); index.close() }
+  })
+})
+
+test('image reads stay inside the source and reject symlinks, unsupported types and oversized files', async () => {
+  await withTempDir(async (root) => {
+    const sourcePath = join(root, 'vault')
+    await mkdir(sourcePath)
+    const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])
+    await writeFile(join(sourcePath, 'image.png'), bytes)
+    await writeFile(join(sourcePath, 'image.svg'), '<svg/>')
+    await writeFile(join(root, 'outside.png'), bytes)
+    await symlink(join(root, 'outside.png'), join(sourcePath, 'link.png'))
+    await writeFile(join(sourcePath, 'large.png'), Buffer.alloc(1024 * 1024 + 1))
+    const service = new KnowledgeService(new Context(), { ...defaults(), knowledgeSources: [{ id: 'vault', name: 'Vault', path: sourcePath, kind: 'folder', include: [], exclude: [] }] }, join(root, 'data'))
+    try {
+      const image = await service.readImage('vault', 'image.png')
+      assert.equal(image.ok, true)
+      assert.equal(image.dataUrl, `data:image/png;base64,${bytes.toString('base64')}`)
+      assert.equal((await service.readImage('vault', '../outside.png')).ok, false)
+      assert.equal((await service.readImage('vault', 'link.png')).ok, false)
+      assert.equal((await service.readImage('vault', 'image.svg')).ok, false)
+      assert.equal((await service.readImage('vault', 'large.png')).code, 'TOO_LARGE')
+    } finally { await service.shutdown() }
+  })
+})
+
 test('SQLite index round-trips docs, searches with highlights, tracks links, and deletes', () => {
   const index = KnowledgeIndex.open(':memory:')
   try {

@@ -15,6 +15,21 @@ export type KnowledgeKey =
   | 'searchIdle'
   | 'searchFailed'
   | 'searchResults'
+  | 'searchAction'
+  | 'searchAllSources'
+  | 'searchClear'
+  | 'searchLoading'
+  | 'searchCount'
+  | 'searchTruncated'
+  | 'searchField'
+  | 'searchFieldAll'
+  | 'searchFieldTitle'
+  | 'searchFieldBody'
+  | 'searchFieldTags'
+  | 'searchFieldLinks'
+  | 'imageLoading'
+  | 'imageFailed'
+  | 'imageLimit'
   | 'browseLabel'
   | 'browseEmpty'
   | 'browseSelectSource'
@@ -35,6 +50,8 @@ export type KnowledgeKey =
   | 'sourceReindex'
   | 'sourceIndexedAt'
   | 'sourceReindexing'
+  | 'sourceIndexFailed'
+  | 'sourceIndexReady'
   | 'inboxLabel'
   | 'inboxEmpty'
   | 'inboxApply'
@@ -80,6 +97,7 @@ export type KnowledgeKey =
   | 'matchLine'
   | 'nativeOpenUnavailable'
   | 'openInDsh'
+  | 'openInBrowse'
   | 'sourceSkipPolicy'
   | 'sourceErrorHelp'
   | 'openFile'
@@ -108,6 +126,21 @@ export const zhCN: Record<KnowledgeKey, string> = {
   searchIdle: '输入关键词搜索，或切换到「浏览」查看笔记目录。',
   searchFailed: '搜索失败',
   searchResults: '检索结果',
+  searchAction: '搜索',
+  searchAllSources: '全部知识源',
+  searchClear: '清空搜索',
+  searchLoading: '正在搜索…',
+  searchCount: '找到 {count} 条结果',
+  searchTruncated: '仅显示前 {count} 条结果，请缩小搜索范围。',
+  searchField: '搜索范围',
+  searchFieldAll: '全部内容',
+  searchFieldTitle: '标题',
+  searchFieldBody: '正文',
+  searchFieldTags: '标签',
+  searchFieldLinks: '链接',
+  imageLoading: '正在加载图片',
+  imageFailed: '无法加载图片',
+  imageLimit: '已达到单篇笔记图片预览上限',
   browseLabel: '浏览',
   browseEmpty: '此目录下没有已索引的笔记或子目录',
   browseSelectSource: '选择知识源进行浏览',
@@ -128,6 +161,8 @@ export const zhCN: Record<KnowledgeKey, string> = {
   sourceReindex: '重新索引',
   sourceIndexedAt: '已索引 {count} 篇 · {time}',
   sourceReindexing: '索引中…',
+  sourceIndexFailed: '索引失败',
+  sourceIndexReady: '索引已更新',
   inboxLabel: '收件箱',
   inboxEmpty: '收件箱为空',
   inboxApply: '写入',
@@ -173,6 +208,7 @@ export const zhCN: Record<KnowledgeKey, string> = {
   matchLine: '匹配行',
   nativeOpenUnavailable: 'DSH 原生文件导航当前不可用，请打开一个会话后重试。',
   openInDsh: '在 DSH 中打开原文',
+  openInBrowse: '在浏览中展示原文',
   sourceSkipPolicy: '索引 Markdown/TXT；忽略隐藏、版本控制和构建目录，以及配置的排除路径。',
   sourceErrorHelp: '检查路径仍可访问且 DSH 有读取权限；修复后点「重新索引」。',
   openFile: '打开',
@@ -201,6 +237,21 @@ export const enUS: Record<KnowledgeKey, string> = {
   searchIdle: 'Enter a keyword to search, or switch to Browse to explore note folders.',
   searchFailed: 'Search failed',
   searchResults: 'Results',
+  searchAction: 'Search',
+  searchAllSources: 'All sources',
+  searchClear: 'Clear search',
+  searchLoading: 'Searching…',
+  searchCount: '{count} results',
+  searchTruncated: 'Showing the first {count} results. Narrow your search to see more.',
+  searchField: 'Search field',
+  searchFieldAll: 'All content',
+  searchFieldTitle: 'Title',
+  searchFieldBody: 'Body',
+  searchFieldTags: 'Tags',
+  searchFieldLinks: 'Links',
+  imageLoading: 'Loading image',
+  imageFailed: 'Image unavailable',
+  imageLimit: 'Image preview limit reached',
   browseLabel: 'Browse',
   browseEmpty: 'No indexed notes or subfolders here',
   browseSelectSource: 'Choose a source to browse',
@@ -221,6 +272,8 @@ export const enUS: Record<KnowledgeKey, string> = {
   sourceReindex: 'Reindex',
   sourceIndexedAt: '{count} notes · {time}',
   sourceReindexing: 'Indexing…',
+  sourceIndexFailed: 'Index failed',
+  sourceIndexReady: 'Index updated',
   inboxLabel: 'Inbox',
   inboxEmpty: 'Inbox is empty',
   inboxApply: 'Apply',
@@ -266,6 +319,7 @@ export const enUS: Record<KnowledgeKey, string> = {
   matchLine: 'Line',
   nativeOpenUnavailable: 'Native DSH file navigation is unavailable. Open a session and try again.',
   openInDsh: 'Open original in DSH',
+  openInBrowse: 'Show original in Browse',
   sourceSkipPolicy: 'Indexes Markdown/TXT; skips hidden, version-control, and build folders, plus configured exclusions.',
   sourceErrorHelp: 'Check that the path exists and DSH can read it, then choose Reindex.',
   openFile: 'Open',

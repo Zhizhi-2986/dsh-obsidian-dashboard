@@ -37,6 +37,7 @@ export class KnowledgeSourceRuntime {
   #fallbackPoll: ReturnType<typeof setInterval> | null = null
   #pending = new Set<string>()
   #syncChain: Promise<void> = Promise.resolve()
+  #queuedSyncs = 0
   #stopped = false
 
   constructor(source: KnowledgeSourceConfig, index: KnowledgeIndex, watchFactory = fsWatchRecursive) {
@@ -47,6 +48,10 @@ export class KnowledgeSourceRuntime {
 
   get state(): SourceSyncState {
     return this.#state
+  }
+
+  get isIndexing(): boolean {
+    return this.#queuedSyncs > 0
   }
 
   startWatch(): void {
@@ -113,7 +118,11 @@ export class KnowledgeSourceRuntime {
   }
 
   #queueSync(relPaths: readonly string[] | null): Promise<void> {
-    const run = () => this.#syncPath(relPaths)
+    this.#queuedSyncs += 1
+    const run = async () => {
+      try { await this.#syncPath(relPaths) }
+      finally { this.#queuedSyncs -= 1 }
+    }
     const task = this.#syncChain.then(run, run)
     this.#syncChain = task.then(() => undefined, () => undefined)
     return task

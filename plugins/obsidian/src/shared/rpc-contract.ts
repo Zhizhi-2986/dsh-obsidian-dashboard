@@ -50,6 +50,7 @@ export const KnowledgeSourceInfoSchema = z.object({
   kind: z.enum(SOURCE_KINDS),
   /** Index freshness: null = not indexed yet. */
   indexedAt: z.number().nullable(),
+  isIndexing: z.boolean(),
   fileCount: z.number(),
   lastError: z.string().nullable(),
 })
@@ -143,6 +144,9 @@ export const ReadDocSchema = z.object({
   updatedAt: z.number().nullable(),
 })
 export type ReadDoc = z.infer<typeof ReadDocSchema>
+
+export const ReadImageOkSchema = z.object({ ok: z.literal(true), dataUrl: z.string() })
+export type ReadImageOk = z.infer<typeof ReadImageOkSchema>
 
 export const SaveDocumentInputSchema = z.object({
   sourceId: z.string(),

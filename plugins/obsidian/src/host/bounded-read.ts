@@ -8,6 +8,14 @@ export async function readHandleTextBounded(
   maxBytes: number,
   signal?: AbortSignal,
 ): Promise<string> {
+  return decodeText(await readHandleBytesBounded(handle, maxBytes, signal))
+}
+
+export async function readHandleBytesBounded(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
   const chunks: Buffer[] = []
   let totalBytes = 0
   while (totalBytes <= maxBytes) {
@@ -19,7 +27,7 @@ export async function readHandleTextBounded(
     if (totalBytes > maxBytes) throw Object.assign(new Error('file exceeds the read limit'), { code: 'FS_TOO_LARGE' })
     chunks.push(buffer.subarray(0, bytesRead))
   }
-  return decodeText(Buffer.concat(chunks, totalBytes))
+  return Buffer.concat(chunks, totalBytes)
 }
 
 export function decodeBoundedText(bytes: Uint8Array): string | null {

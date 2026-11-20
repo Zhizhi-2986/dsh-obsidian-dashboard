@@ -41,16 +41,17 @@ async function withPanel(rpc, run, context = {}) {
   }
 }
 
-test('search results preserve source, path, line, copy citation, and open the DSH native resource', async () => {
-  const opened = []
+test('search result opens the note in Browse and returns to its source directory', async () => {
   let copied = ''
-  let mountedSessionId
+  const browsed = []
   const rpc = {
     listSources: async () => ({ ok: true, sources: [source] }),
     listInbox: async () => ({ ok: true, items: [] }),
     search: async (query) => ({ ok: true, query, hits: [
       { sourceId: source.id, path: 'notes/guide one.md', title: 'Guide', tags: [], updatedAt: 1, snippet: 'matched passage', line: 42 },
     ], truncated: false }),
+    read: async (sourceId, path) => ({ ok: true, sourceId, path, content: '# Original note\nFull content', version: 'v1', title: 'Guide', tags: [], links: [], backlinks: [], updatedAt: 1 }),
+    browse: async (sourceId, directoryPath) => { browsed.push([sourceId, directoryPath]); return { ok: true, sourceId, directoryPath, directories: [], documents: [] } },
   }
   await withPanel(rpc, async (document) => {
     Object.defineProperty(document.defaultView.navigator, 'clipboard', { configurable: true, value: { writeText: async (value) => { copied = value } } })
@@ -62,15 +63,68 @@ test('search results preserve source, path, line, copy citation, and open the DS
     await act(async () => clickButton(document, 'Copy citation'))
     assert.match(copied, /Guide — Vault · notes\/guide one\.md:42/)
     assert.match(copied, /matched passage/)
-    await act(async () => clickButton(document, 'Open original in DSH'))
-  }, {
-    sidebarRight: {
-      mounted: { getSnapshot: () => mountedSessionId },
-      openResource: (address, options) => opened.push({ address, options }),
-    },
-    layout: { selectPanel: (panelId) => { assert.equal(panelId, null); mountedSessionId = 'session-1' } },
+    await act(async () => clickButton(document, 'Show original in Browse'))
+    assert.match(document.body.textContent, /Full content/)
+    await act(async () => clickButton(document, 'Back'))
+    assert.deepEqual(browsed.at(-1), ['vault', 'notes'])
   })
-  assert.deepEqual(opened, [{ address: 'dsh-resource://file/session/session-1//vault/notes/guide%20one.md', options: { params: { line: 42 } } }])
+})
+
+test('search field selection is sent to the service', async () => {
+  const calls = []
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    search: async (query, options) => { calls.push({ query, options }); return { ok: true, query, hits: [], truncated: false } },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => changeInput(document, document.querySelector('input'), 'topic'))
+    const select = document.querySelector('select[aria-label="Search field"]')
+    await act(async () => { select.value = 'title'; Simulate.change(select, { target: { value: 'title' } }) })
+    await act(async () => clickButton(document, 'Search'))
+    assert.equal(calls.at(-1).options.field, 'title')
+  })
+})
+
+test('note preview loads source-relative images without requesting external images', async () => {
+  const requested = []
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    search: async (query) => ({ ok: true, query, hits: [{ sourceId: 'vault', path: 'notes/a.md', title: 'A note', tags: [], updatedAt: 1, snippet: null, line: null }], truncated: false }),
+    read: async () => ({ ok: true, sourceId: 'vault', path: 'notes/a.md', content: '![Local](../images/a.png) ![Remote](https://example.com/a.png)', version: 'v1', title: 'A note', tags: [], links: [], backlinks: [], updatedAt: 1 }),
+    readImage: async (sourceId, path) => { requested.push([sourceId, path]); return { ok: true, dataUrl: 'data:image/png;base64,iVBORw0KGgo=' } },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => changeInput(document, document.querySelector('input'), 'note'))
+    await act(async () => clickButton(document, 'Search'))
+    await act(async () => clickButton(document, 'A note'))
+    assert.deepEqual(requested, [['vault', 'images/a.png']])
+    assert.equal(document.querySelector('img')?.getAttribute('src'), 'data:image/png;base64,iVBORw0KGgo=')
+    assert.match(document.body.textContent, /Image unavailable: Remote/)
+  })
+})
+
+test('note preview limits image reads and performs them one at a time', async () => {
+  let calls = 0
+  let active = 0
+  let maxActive = 0
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    search: async (query) => ({ ok: true, query, hits: [{ sourceId: 'vault', path: 'a.md', title: 'A note', tags: [], updatedAt: 1, snippet: null, line: null }], truncated: false }),
+    read: async () => ({ ok: true, sourceId: 'vault', path: 'a.md', content: Array.from({ length: 17 }, (_, i) => `![${i}](image${i}.png)`).join('\n\n'), version: 'v1', title: 'A note', tags: [], links: [], backlinks: [], updatedAt: 1 }),
+    readImage: async () => { calls++; active++; maxActive = Math.max(maxActive, active); await new Promise((resolve) => setTimeout(resolve, 1)); active--; return { ok: true, dataUrl: 'data:image/png;base64,AA==' } },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => changeInput(document, document.querySelector('input'), 'note'))
+    await act(async () => clickButton(document, 'Search'))
+    await act(async () => clickButton(document, 'A note'))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 80)))
+    assert.equal(calls, 16)
+    assert.equal(maxActive, 1)
+    assert.match(document.body.textContent, /Image preview limit reached/)
+  })
 })
 
 test('Inbox dismissal errors are shown and leave the proposal pending', async () => {
@@ -114,6 +168,24 @@ function changeTextArea(document, value) {
   Simulate.change(textarea, { target: { value } })
 }
 
+test('clicking a browse note row opens the note using a keyboard-accessible button', async () => {
+  const reads = []
+  const rpc = {
+    listSources: async () => ({ ok: true, sources: [source] }),
+    listInbox: async () => ({ ok: true, items: [] }),
+    browse: async (sourceId) => ({ ok: true, sourceId, directoryPath: '', directories: [], documents: [{ sourceId, path: 'note.md', title: 'Note', tags: [], updatedAt: 1 }] }),
+    read: async (sourceId, path) => { reads.push(path); return { ok: true, sourceId, path, content: '# Note content', version: 'v1', title: 'Note', tags: [], links: [], backlinks: [], updatedAt: 1 } },
+  }
+  await withPanel(rpc, async (document) => {
+    await act(async () => clickButton(document, 'Browse'))
+    const row = document.querySelector('.knowledge-file-row')
+    assert.equal(row?.tagName, 'BUTTON')
+    await act(async () => row.querySelector('span').dispatchEvent(new document.defaultView.MouseEvent('click', { bubbles: true })))
+    assert.deepEqual(reads, ['note.md'])
+    assert.match(document.body.textContent, /Note content/)
+  })
+})
+
 test('manual save does not require a session and preserves the draft while saving', async () => {
   let savedInput
   let finishSave
@@ -131,7 +203,7 @@ test('manual save does not require a session and preserves the draft while savin
   await withPanel(rpc, async (document) => {
     await act(async () => clickButton(document, 'Browse'))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
-    await act(async () => clickButton(document, 'Open'))
+    await act(async () => document.querySelector('.knowledge-file-row').click())
     await act(async () => clickButton(document, '编辑笔记'))
     await act(async () => changeTextArea(document, '# After'))
     await act(async () => clickButton(document, '保存'))
@@ -163,7 +235,7 @@ test('a successful save keeps its new version when refreshing the preview throws
   await withPanel(rpc, async (document) => {
     await act(async () => clickButton(document, 'Browse'))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
-    await act(async () => clickButton(document, 'Open'))
+    await act(async () => document.querySelector('.knowledge-file-row').click())
     await act(async () => clickButton(document, '编辑笔记'))
     await act(async () => changeTextArea(document, '# First'))
     await act(async () => { clickButton(document, '保存'); await new Promise((resolve) => setTimeout(resolve, 0)) })
@@ -191,7 +263,7 @@ test('source manager exposes a manual reindex action and refreshes the displayed
     await act(async () => clickButton(document, 'Knowledge sources'))
     await act(async () => { clickButton(document, 'Reindex'); await new Promise((resolve) => setTimeout(resolve, 0)) })
     assert.deepEqual(indexedSources, ['vault'])
-    assert.match(document.body.textContent, /4 ·/)
+    assert.match(document.body.textContent, /4 notes ·/)
   })
 })
 
@@ -274,7 +346,7 @@ test('Wikilink navigation stays in Browse and updates the inline note preview', 
   await withPanel(rpc, async (document) => {
     await act(async () => clickButton(document, 'Browse'))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
-    const open = [...document.querySelectorAll('button')].find((button) => button.textContent === 'Open')
+    const open = document.querySelector('.knowledge-file-row')
     assert.ok(open)
     await act(async () => open.dispatchEvent(new document.defaultView.MouseEvent('click', { bubbles: true })))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)))
@@ -303,10 +375,10 @@ test('a slower earlier document read cannot replace the most recently selected n
     const input = document.querySelector('input')
     assert.ok(input)
     await act(async () => changeInput(document, input, 'notes'))
-    const searchButton = [...document.querySelectorAll('button')].filter((button) => button.textContent === 'Results').at(-1)
+    const searchButton = [...document.querySelectorAll('button')].find((button) => button.textContent === 'Search')
     assert.ok(searchButton)
     await act(async () => { searchButton.dispatchEvent(new document.defaultView.MouseEvent('click', { bubbles: true })); await new Promise((resolve) => setTimeout(resolve, 0)) })
-    const openButtons = [...document.querySelectorAll('button')].filter((button) => button.textContent === 'Open')
+    const openButtons = [...document.querySelectorAll('button')].filter((button) => ['A note', 'B note'].includes(button.textContent))
     assert.equal(openButtons.length, 2)
     await act(async () => openButtons[0].dispatchEvent(new document.defaultView.MouseEvent('click', { bubbles: true })))
     assert.equal(typeof resolveFirst, 'function')

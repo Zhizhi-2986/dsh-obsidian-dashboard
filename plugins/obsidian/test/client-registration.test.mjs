@@ -8,6 +8,9 @@ test('profile-scoped knowledge RPCs do not require an active Session lookup', ()
   const browse = TYPERT_REMOTE.descriptors.find((entry) => entry.method === 'browse')
   assert.ok(browse)
   assert.deepEqual(browse.parameters.map((parameter) => parameter.name), ['sourceId', 'directoryPath'])
+  const image = TYPERT_REMOTE.descriptors.find((entry) => entry.method === 'readImage')
+  assert.ok(image)
+  assert.deepEqual(image.parameters.map((parameter) => parameter.name), ['sourceId', 'relPath'])
   assert.equal(TYPERT_REMOTE.descriptors.every((entry) => entry.parameters.every((parameter) => parameter.source !== 'lookup')), true)
 })
 
@@ -21,17 +24,19 @@ test('registers direct knowledge-page source management RPCs', () => {
 })
 
 test('unwraps the installed DSH Gateway envelope before returning knowledge results', async () => {
-  const source = { id: 'vault', name: 'Vault', path: '/vault', kind: 'folder', indexedAt: 1, fileCount: 2, lastError: null }
+  const source = { id: 'vault', name: 'Vault', path: '/vault', kind: 'folder', indexedAt: 1, isIndexing: false, fileCount: 2, lastError: null }
   const remote = { knowledge: {
     listSources: async () => ({ ok: true, value: { ok: true, sources: [source] } }),
     addSource: async () => ({ ok: true, value: { ok: true, source } }),
     removeSource: async () => ({ ok: true, value: { ok: true } }),
     browse: async () => ({ ok: true, value: { ok: true, sourceId: 'vault', directoryPath: '', directories: [], documents: [] } }),
+    readImage: async () => ({ ok: true, value: { ok: true, dataUrl: 'data:image/png;base64,AA==' } }),
   } }
   const rpc = knowledgeRpcOf({ remote })
   assert.deepEqual(await rpc.listSources(), { ok: true, sources: [source] })
   assert.deepEqual(await rpc.addSource({ name: 'Vault', path: '/vault', kind: 'folder' }), { ok: true, source })
   assert.deepEqual(await rpc.removeSource('vault'), { ok: true })
+  assert.deepEqual(await rpc.readImage('vault', 'image.png'), { ok: true, dataUrl: 'data:image/png;base64,AA==' })
   assert.deepEqual(await rpc.browse('vault', ''), {
     ok: true, sourceId: 'vault', directoryPath: '', directories: [], documents: [],
   })

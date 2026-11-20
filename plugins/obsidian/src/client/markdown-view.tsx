@@ -1,7 +1,7 @@
-import { createElement, type ReactElement, type ReactNode } from 'react'
+import { createElement, useEffect, useState, type ReactElement, type ReactNode } from 'react'
 import type { DocLink } from '../shared/rpc-contract.ts'
 
-const tokenPattern = /(!?\[[^\]]*\]\([^)]+\)|\[\[[^\]]+\]\]|`[^`]+`|\*\*[^*]+\*\*)/gu
+const tokenPattern = /(!\[\[[^\]]+\]\]|!?\[[^\]]*\]\([^)]+\)|\[\[[^\]]+\]\]|`[^`]+`|\*\*[^*]+\*\*)/gu
 const safeProtocols = new Set(['http:', 'https:', 'mailto:'])
 
 function plainInlineText(text: string): string {
@@ -11,7 +11,9 @@ function plainInlineText(text: string): string {
     const token = match[0]
     const index = match.index ?? 0
     if (index > cursor) chunks.push(text.slice(cursor, index))
-    if (token.startsWith('![')) {
+    if (token.startsWith('![[')) {
+      chunks.push(token.slice(3, -2).split('|', 1)[0] ?? '')
+    } else if (token.startsWith('![')) {
       const alt = token.slice(2, token.indexOf(']('))
       chunks.push(`Image: ${alt || 'embedded image'}`)
     } else if (token.startsWith('[[')) {
@@ -57,7 +59,7 @@ function safeHref(value: string): string | null {
   }
 }
 
-function inlineNodes(text: string, links: readonly DocLink[], onNavigate?: (path: string, fragment?: string) => void): ReactNode[] {
+function inlineNodes(text: string, links: readonly DocLink[], onNavigate?: (path: string, fragment?: string) => void, imageOptions?: ImageOptions): ReactNode[] {
   const nodes: ReactNode[] = []
   let cursor = 0
   for (const match of text.matchAll(tokenPattern)) {
@@ -66,8 +68,14 @@ function inlineNodes(text: string, links: readonly DocLink[], onNavigate?: (path
     if (index > cursor) nodes.push(text.slice(cursor, index))
     const key = `${index}:${token}`
     if (token.startsWith('![')) {
-      const alt = token.slice(2, token.indexOf(']('))
-      nodes.push(createElement('span', { key, title: 'Images are not loaded in the knowledge reader', style: styles.imagePlaceholder }, `Image: ${alt || 'embedded image'}`))
+      const isWiki = token.startsWith('![[')
+      const [target, alias] = isWiki ? token.slice(3, -2).split('|', 2) : [token.slice(token.indexOf('](') + 2, -1).trim(), token.slice(2, token.indexOf(']('))]
+      if (imageOptions && imageOptions.remaining > 0) {
+        imageOptions.remaining -= 1
+        nodes.push(createElement(NoteImage, { key, target: target ?? '', alt: alias || target || '', options: imageOptions }))
+      } else {
+        nodes.push(createElement('span', { key, style: styles.imagePlaceholder }, `${imageOptions?.imageLimit ?? 'Image preview limit reached'}: ${alias || target || ''}`))
+      }
     } else if (token.startsWith('[[')) {
       const raw = token.slice(2, -2)
       const [target, alias] = raw.split('|', 2)
@@ -111,10 +119,49 @@ export interface MarkdownViewProps {
   readonly content: string
   readonly links?: readonly DocLink[]
   readonly onNavigate?: (path: string, fragment?: string) => void
+  readonly documentPath?: string
+  readonly loadImage?: (path: string, signal: AbortSignal) => Promise<string>
+  readonly imageLoading?: string
+  readonly imageFailed?: string
+  readonly imageLimit?: string
+}
+
+type ImageOptions = Pick<MarkdownViewProps, 'documentPath' | 'loadImage' | 'imageLoading' | 'imageFailed' | 'imageLimit'> & { remaining: number }
+
+function imagePath(documentPath: string, target: string): string | null {
+  if (!target || /^[a-z][a-z\d+.-]*:/iu.test(target) || target.startsWith('/') || target.includes('\\') || /[?#]/u.test(target)) return null
+  let decoded: string
+  try { decoded = decodeURIComponent(target) } catch { return null }
+  if (decoded.startsWith('/') || decoded.includes('\\') || decoded.includes('\0')) return null
+  const parts = documentPath.split('/').slice(0, -1)
+  for (const part of decoded.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') { if (parts.length === 0) return null; parts.pop() }
+    else parts.push(part)
+  }
+  return parts.join('/') || null
+}
+
+function NoteImage({ target, alt, options }: { target: string; alt: string; options?: ImageOptions }): ReactElement {
+  const [state, setState] = useState<{ url: string | null; failed: boolean }>({ url: null, failed: false })
+  const resolved = imagePath(options?.documentPath ?? '', target)
+  const load = options?.loadImage
+  useEffect(() => {
+    if (!resolved || !load) { setState({ url: null, failed: true }); return }
+    const controller = new AbortController()
+    setState({ url: null, failed: false })
+    void load(resolved, controller.signal).then((url) => { if (!controller.signal.aborted) setState({ url, failed: false }) })
+      .catch(() => { if (!controller.signal.aborted) setState({ url: null, failed: true }) })
+    return () => controller.abort()
+  }, [resolved, load])
+  return state.url
+    ? createElement('img', { src: state.url, alt, style: { maxWidth: '100%', height: 'auto', borderRadius: 8 }, onError: () => setState({ url: null, failed: true }) })
+    : createElement('span', { style: styles.imagePlaceholder }, `${state.failed ? options?.imageFailed ?? 'Image unavailable' : options?.imageLoading ?? 'Loading image…'}: ${alt}`)
 }
 
 /** A deliberately small React renderer: source is rendered as text, never as HTML. */
-export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewProps): ReactElement {
+export function MarkdownView({ content, links = [], onNavigate, documentPath, loadImage, imageLoading, imageFailed, imageLimit }: MarkdownViewProps): ReactElement {
+  const imageOptions = { documentPath, loadImage, imageLoading, imageFailed, imageLimit, remaining: 16 }
   const lines = content.split(/\r?\n/u)
   const blocks: ReactNode[] = []
   let index = 0
@@ -143,7 +190,7 @@ export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewPr
       const level = heading[1]!.length
       const baseId = slugHeading(plainInlineText(heading[2]!)) || 'heading'
       const id = uniqueHeadingId(baseId, headingIds)
-      blocks.push(createElement(`h${level}`, { key: key++, id, style: styles.heading }, inlineNodes(heading[2]!, links, onNavigate)))
+      blocks.push(createElement(`h${level}`, { key: key++, id, style: styles.heading }, inlineNodes(heading[2]!, links, onNavigate, imageOptions)))
       index += 1
       continue
     }
@@ -160,7 +207,7 @@ export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewPr
         quote.push((lines[index] ?? '').trim().replace(/^>\s?/u, ''))
         index += 1
       }
-      const quoteParagraphs = quote.map((text, quoteIndex) => createElement('p', { key: quoteIndex }, ...inlineNodes(text, links, onNavigate)))
+      const quoteParagraphs = quote.map((text, quoteIndex) => createElement('p', { key: quoteIndex }, ...inlineNodes(text, links, onNavigate, imageOptions)))
       blocks.push(createElement('blockquote', { key: key++, style: styles.quote }, ...quoteParagraphs))
       continue
     }
@@ -174,8 +221,8 @@ export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewPr
         index += 1
       }
       blocks.push(createElement('table', { key: key++, style: styles.table },
-        createElement('thead', null, createElement('tr', null, ...header.map((cell, i) => createElement('th', { key: i, style: styles.cell }, inlineNodes(cell, links, onNavigate))))),
-        createElement('tbody', null, ...rows.map((row, rowIndex) => createElement('tr', { key: rowIndex }, ...row.map((cell, i) => createElement('td', { key: i, style: styles.cell }, inlineNodes(cell, links, onNavigate))))))))
+        createElement('thead', null, createElement('tr', null, ...header.map((cell, i) => createElement('th', { key: i, style: styles.cell }, inlineNodes(cell, links, onNavigate, imageOptions))))),
+        createElement('tbody', null, ...rows.map((row, rowIndex) => createElement('tr', { key: rowIndex }, ...row.map((cell, i) => createElement('td', { key: i, style: styles.cell }, inlineNodes(cell, links, onNavigate, imageOptions))))))))
       continue
     }
 
@@ -186,7 +233,7 @@ export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewPr
       while (index < lines.length) {
         const current = /^\s*([-*+] |\d+\. )(.*)$/u.exec(lines[index] ?? '')
         if (!current || /^\d+\./u.test(current[1]!) !== ordered) break
-        items.push(createElement('li', { key: items.length }, inlineNodes(current[2]!, links, onNavigate)))
+        items.push(createElement('li', { key: items.length }, inlineNodes(current[2]!, links, onNavigate, imageOptions)))
         index += 1
       }
       blocks.push(createElement(ordered ? 'ol' : 'ul', { key: key++, style: styles.list }, ...items))
@@ -199,20 +246,20 @@ export function MarkdownView({ content, links = [], onNavigate }: MarkdownViewPr
       paragraph.push((lines[index] ?? '').trim())
       index += 1
     }
-    blocks.push(createElement('p', { key: key++, style: styles.paragraph }, inlineNodes(paragraph.join(' '), links, onNavigate)))
+    blocks.push(createElement('p', { key: key++, style: styles.paragraph }, inlineNodes(paragraph.join(' '), links, onNavigate, imageOptions)))
   }
 
   return createElement('article', { className: 'dsh-obsidian-markdown', style: styles.article }, ...blocks)
 }
 
 const styles: Record<string, object> = {
-  article: { lineHeight: 1.75, overflowWrap: 'anywhere', padding: '12px 16px' },
-  heading: { lineHeight: 1.35, margin: '1.2em 0 0.55em' },
+  article: { width: '100%', boxSizing: 'border-box', lineHeight: 1.85, overflowWrap: 'anywhere', padding: '24px 28px 48px', fontSize: 14 },
+  heading: { lineHeight: 1.3, letterSpacing: '-0.02em', margin: '1.5em 0 0.6em' },
   paragraph: { margin: '0 0 0.9em', whiteSpace: 'pre-wrap' },
   list: { paddingInlineStart: 24, margin: '0 0 1em' },
   pre: { overflowX: 'auto', padding: 12, borderRadius: 8, background: 'rgba(127,127,127,0.1)', whiteSpace: 'pre' },
   inlineCode: { padding: '1px 4px', borderRadius: 4, background: 'rgba(127,127,127,0.14)', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
-  quote: { margin: '1em 0', padding: '0.2em 1em', borderLeft: '3px solid rgba(127,127,127,0.35)', opacity: 0.85 },
+  quote: { margin: '1.4em 0', padding: '0.2em 1.2em', borderLeft: '3px solid #6b91cf', background: 'rgba(107,145,207,0.07)', opacity: 0.9 },
   rule: { border: 0, borderTop: '1px solid rgba(127,127,127,0.25)', margin: '1.4em 0' },
   table: { borderCollapse: 'collapse', width: '100%', margin: '1em 0' },
   cell: { padding: '7px 9px', textAlign: 'left', borderBottom: '1px solid rgba(127,127,127,0.2)' },

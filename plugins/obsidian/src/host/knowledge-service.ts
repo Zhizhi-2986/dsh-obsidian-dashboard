@@ -20,7 +20,7 @@ import {
   KNOWLEDGE_SERVICE, fail, isFailResult, MAX_INBOX_ITEMS,
   type AddSourceInput, type AddSourceOk, type ApplyOk, type BrowseOk, type FailResult, type InboxItem,
   type KnowledgeResult, type KnowledgeSourceInfo, type ListSourcesOk,
-  type ProposeInput, type ReadDoc, type RebaseOperation, type SearchOk, type SearchOptions,
+  type ProposeInput, type ReadDoc, type ReadImageOk, type RebaseOperation, type SearchOk, type SearchOptions,
   type SourceKind, type SaveDocumentInput, type SaveDocumentOk,
 } from '../shared/rpc-contract.ts'
 import { KnowledgeIndex } from './indexer.ts'
@@ -34,7 +34,7 @@ import { rebaseInboxProposal } from './inbox-rebase.ts'
 import { failure, errorMessage } from './failure.ts'
 import { withKeyedLock } from './keyed-lock.ts'
 import { KnowledgeSourceStore } from './source-store.ts'
-import { MAX_PROPOSAL_BASELINE_BYTES, decodeBoundedText, readHandleTextBounded } from './bounded-read.ts'
+import { MAX_PROPOSAL_BASELINE_BYTES, decodeBoundedText, readHandleBytesBounded, readHandleTextBounded } from './bounded-read.ts'
 import { assertUniqueSourceIds, sameSourceIndexingConfig } from './source-config.ts'
 import { captureSourceRootIdentity, normalizeSourceRelPath, resolveContainedPath, sourceRootIdentityMatches } from './source-path.ts'
 import { hasRootIdentity, sourceRootFailure } from './source-root.ts'
@@ -42,6 +42,7 @@ import { hasRootIdentity, sourceRootFailure } from './source-root.ts'
 const DEFAULT_SEARCH_LIMIT = 20
 const MAX_SEARCH_LIMIT = 100
 const MAX_QUERY_CHARS = 256
+const MAX_IMAGE_BYTES = 1024 * 1024
 const SOURCE_REMOVAL_CONFLICT_MESSAGE = 'knowledge source was removed; this proposal is retained but cannot be applied'
 export class KnowledgeService extends TypertRemoteService {
   /** Public because Cordis proxies forward service reads/writes through it. */
@@ -285,8 +286,8 @@ export class KnowledgeService extends TypertRemoteService {
     }
     const limit = Math.min(Math.max(options.limit ?? DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT)
     const field = options.field ?? 'body'
-    const hits = this.#index.search(options.sourceId, field, trimmed, limit)
-    return { ok: true, query: trimmed, hits, truncated: hits.length >= limit }
+    const hits = this.#index.search(options.sourceId, field, trimmed, limit + 1)
+    return { ok: true, query: trimmed, hits: hits.slice(0, limit), truncated: hits.length > limit }
   }
 
   async readSource(sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadDoc>> {
@@ -713,6 +714,42 @@ export class KnowledgeService extends TypertRemoteService {
   }
 
   @Remote
+  async readImage(sourceId: string, relPath: string, signal?: AbortSignal): Promise<KnowledgeResult<ReadImageOk>> {
+    await this.#ready
+    const source = this.#sourceOf(sourceId)
+    if (source === null) return fail('NOT_FOUND', 'unknown knowledge source')
+    const relative = normalizeSourceRelPath(relPath)
+    if (relative === null) return fail('OUTSIDE_SOURCE', 'image path is outside the configured source')
+    const mimeByExtension: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' }
+    const mime = mimeByExtension[path.extname(relative).toLowerCase()]
+    if (!mime) return fail('INVALID', 'unsupported image type')
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+    try {
+      const rootFailure = await sourceRootFailure(source)
+      if (rootFailure !== null) return rootFailure
+      const absolute = await resolveContainedPath(source.path, relative)
+      if (absolute === null) return fail('OUTSIDE_SOURCE', 'image path is outside the configured source')
+      const noFollow = process.platform === 'win32' ? 0 : fsConstants.O_NOFOLLOW
+      handle = await fs.open(absolute, fsConstants.O_RDONLY | noFollow | (fsConstants.O_NONBLOCK ?? 0))
+      const before = await handle.stat()
+      if (!before.isFile()) return fail('NOT_FOUND', 'image file not found')
+      if (before.size > MAX_IMAGE_BYTES) return fail('TOO_LARGE', 'image exceeds the read limit')
+      const bytes = await readHandleBytesBounded(handle, MAX_IMAGE_BYTES, signal)
+      const after = await handle.stat()
+      const verified = await resolveContainedPath(source.path, relative)
+      const current = await fs.lstat(absolute)
+      const rootAfter = await sourceRootFailure(source)
+      if (rootAfter !== null) return rootAfter
+      if (verified !== absolute || current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino || after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs || after.size !== before.size || current.mtimeMs !== before.mtimeMs || current.size !== before.size) return fail('CONFLICT', 'image changed while it was being read')
+      return { ok: true, dataUrl: `data:${mime};base64,${bytes.toString('base64')}` }
+    } catch (error) {
+      return failure(error, fail('IO', 'failed to read image'))
+    } finally {
+      await handle?.close().catch(() => undefined)
+    }
+  }
+
+  @Remote
   async saveDocument(input: SaveDocumentInput, signal?: AbortSignal): Promise<KnowledgeResult<SaveDocumentOk>> {
     await this.#ready
     signal?.throwIfAborted()
@@ -920,7 +957,7 @@ export class KnowledgeService extends TypertRemoteService {
   #infoOf(sourceId: string): KnowledgeSourceInfo {
     const source = this.#sourceOf(sourceId)
     if (source === null) {
-      return { id: sourceId, name: '', path: '', kind: 'folder', indexedAt: null, fileCount: 0, lastError: 'unknown source' }
+      return { id: sourceId, name: '', path: '', kind: 'folder', indexedAt: null, isIndexing: false, fileCount: 0, lastError: 'unknown source' }
     }
     const runtime = this.#runtimes.get(sourceId)
     return {
@@ -929,6 +966,7 @@ export class KnowledgeService extends TypertRemoteService {
       path: source.path,
       kind: source.kind,
       indexedAt: runtime?.state.indexedAt ?? null,
+      isIndexing: runtime?.isIndexing ?? false,
       fileCount: runtime?.state.fileCount ?? 0,
       lastError: this.#rootErrors.get(sourceId) ?? runtime?.state.lastError ?? null,
     }

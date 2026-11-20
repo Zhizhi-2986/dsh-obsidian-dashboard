@@ -155,7 +155,7 @@ const value = 1
       setter.call(input, 'k8s')
       Simulate.change(input, { target: { value: 'k8s' } })
     })
-    const searchButton = [...dom.window.document.querySelectorAll('button')].filter((button) => button.textContent === 'Results').at(-1)
+    const searchButton = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Search')
     await act(async () => searchButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))
     const citationButton = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Copy citation')
     assert.ok(citationButton)
@@ -163,7 +163,7 @@ const value = 1
     assert.match(copiedPath, /> k8s — Vault · PWD\/k8s\.md:12/)
     assert.match(copiedPath, /> Found on this line/)
     assert.match(copiedPath, /\[Open original in DSH\]\(<\/Users\/zhizhi\/Documents\/Vault\/PWD\/k8s\.md#L12>\)/)
-    const openButton = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Open')
+    const openButton = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'k8s')
     assert.ok(openButton)
     await act(async () => openButton.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))
     await act(async () => new Promise((resolve) => setTimeout(resolve, 10)))
@@ -255,7 +255,7 @@ test('heading fragment scrolling stays within the Knowledge panel that initiated
       await new Promise((resolve) => setTimeout(resolve, 5))
     })
     for (const root of [dom.window.document.querySelector('#root-a'), dom.window.document.querySelector('#root-b')]) {
-      const open = [...root.querySelectorAll('button')].find((button) => button.textContent === 'Open')
+      const open = root.querySelector('.knowledge-file-row')
       await act(async () => open.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))
     }
     await act(async () => new Promise((resolve) => setTimeout(resolve, 5)))

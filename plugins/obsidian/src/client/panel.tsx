@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, useRef, type FormEvent, type ReactElement } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SearchHit, SourceKind } from '../shared/rpc-contract.ts'
+import type { BrowseOk, InboxItem, KnowledgeSourceInfo, ReadDoc, SearchHit, SearchOptions, SourceKind } from '../shared/rpc-contract.ts'
 import type { KnowledgeRpc } from './remote.ts'
 import { MarkdownView, slugHeading } from './markdown-view.tsx'
 import { pickDirectory } from './directory-picker.ts'
@@ -14,46 +14,46 @@ const PANEL_TABS = ['search', 'browse', 'sources', 'preview', 'inbox'] as const
 type PanelTab = (typeof PANEL_TABS)[number]
 
 const s = {
-  root: { display: 'flex', flexDirection: 'column' as const, height: '100%', minWidth: 0, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif', fontSize: 13, letterSpacing: '-0.1px' },
-  header: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px 8px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 3%, transparent)' },
+  root: { display: 'flex', flexDirection: 'column' as const, height: '100%', minWidth: 0, fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif', fontSize: 13, lineHeight: 1.5, letterSpacing: '-0.1px' },
+  header: { display: 'flex', alignItems: 'center', gap: 8, padding: '16px 20px', borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)' },
   tabs: { display: 'flex', gap: 3, padding: '7px 14px 0', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)' },
   tab: (active: boolean) => ({
     padding: '5px 10px', borderRadius: 7, cursor: 'pointer', border: 'none', background: active ? 'color-mix(in srgb, currentColor 12%, transparent)' : 'transparent',
     color: 'inherit', fontSize: 12, opacity: active ? 1 : 0.72, transition: 'background 120ms ease, opacity 120ms ease',
   }),
-  searchRow: { display: 'flex', gap: 6, padding: '8px 12px', alignItems: 'center' },
-  input: { flex: 1, minWidth: 0, padding: '6px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
-  select: { padding: '5px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 12, maxWidth: 140 },
-  body: { flex: 1, overflowY: 'auto' as const, padding: '8px 12px 16px' },
-  hit: { padding: '8px 10px', borderRadius: 8, marginBottom: 6, border: '1px solid rgba(127,127,127,0.14)', background: 'rgba(127,127,127,0.06)' },
-  hitTitle: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, fontWeight: 600 },
-  hitMeta: { color: 'rgba(127,127,127,0.85)', fontSize: 11, marginTop: 2 },
-  hitSnippet: { color: 'rgba(127,127,127,0.75)', fontSize: 12, marginTop: 4, whiteSpace: 'pre-wrap' as const, wordBreak: 'break-word' as const },
+  searchRow: { display: 'flex', gap: 8, padding: '18px 20px 8px', alignItems: 'center' },
+  input: { flex: 1, minWidth: 0, padding: '9px 12px', borderRadius: 9, border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', background: 'color-mix(in srgb, currentColor 3%, transparent)', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
+  select: { padding: '8px 10px', borderRadius: 9, border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 12, maxWidth: 140 },
+  body: { flex: 1, overflowY: 'auto' as const, padding: '12px 20px 24px' },
+  hit: { padding: '15px 16px', borderRadius: 10, marginBottom: 10, border: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 2%, transparent)' },
+  hitTitle: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' as const, fontSize: 14, fontWeight: 650 },
+  hitMeta: { color: 'color-mix(in srgb, currentColor 62%, transparent)', fontSize: 11, marginTop: 4, overflowWrap: 'anywhere' as const },
+  hitSnippet: { color: 'color-mix(in srgb, currentColor 72%, transparent)', fontSize: 12, lineHeight: 1.65, marginTop: 8, whiteSpace: 'pre-wrap' as const, wordBreak: 'break-word' as const },
   tags: { display: 'flex', gap: 4, flexWrap: 'wrap' as const, marginTop: 4 },
   tag: { fontSize: 11, color: 'rgba(127,127,127,0.8)', padding: '1px 6px', borderRadius: 8, background: 'rgba(127,127,127,0.12)' },
   button: (tone: 'plain' | 'primary' | 'danger' = 'plain') => ({
-    padding: '5px 11px', borderRadius: 7, border: '1px solid color-mix(in srgb, currentColor 18%, transparent)', cursor: 'pointer', fontSize: 12,
+    padding: '7px 12px', borderRadius: 8, border: '1px solid color-mix(in srgb, currentColor 16%, transparent)', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 550, fontSize: 12,
     background: tone === 'primary' ? '#3478f6' : tone === 'danger' ? '#d85b57' : 'color-mix(in srgb, currentColor 3%, transparent)',
     color: tone === 'plain' ? 'inherit' : '#fff', opacity: 1,
   }),
-  empty: { color: 'rgba(127,127,127,0.7)', padding: '24px 8px', textAlign: 'center' as const, fontSize: 12 },
-  row: { display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 8, marginBottom: 6, border: '1px solid rgba(127,127,127,0.14)', background: 'rgba(127,127,127,0.06)' },
+  empty: { color: 'color-mix(in srgb, currentColor 60%, transparent)', padding: '48px 16px', textAlign: 'center' as const, fontSize: 12, lineHeight: 1.7 },
+  row: { display: 'flex', alignItems: 'center', gap: 10, padding: '11px 12px', borderRadius: 9, marginBottom: 6, border: '1px solid color-mix(in srgb, currentColor 10%, transparent)', background: 'color-mix(in srgb, currentColor 2%, transparent)' },
   badge: (tone: string) => ({ fontSize: 10, padding: '1px 7px', borderRadius: 9, background: tone, color: '#0d0f12', fontWeight: 600 }),
-  browseToolbar: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.14)' },
-  breadcrumb: { display: 'flex', alignItems: 'center', gap: 4, padding: '6px 12px', color: 'rgba(127,127,127,0.8)', fontSize: 11, overflowX: 'auto' as const },
+  browseToolbar: { display: 'flex', alignItems: 'center', gap: 8, padding: '14px 20px', borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)' },
+  breadcrumb: { display: 'flex', alignItems: 'center', gap: 4, padding: '10px 20px 2px', color: 'rgba(127,127,127,0.8)', fontSize: 11, overflowX: 'auto' as const },
   folderButton: { width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', marginBottom: 5, borderRadius: 7, border: '1px solid rgba(127,127,127,0.14)', background: 'rgba(127,127,127,0.05)', color: 'inherit', textAlign: 'left' as const, cursor: 'pointer' },
-  sourceForm: { display: 'flex', flexDirection: 'column' as const, gap: 10, maxWidth: 720, margin: '12px auto', padding: 16, borderRadius: 10, border: '1px solid rgba(127,127,127,0.2)', background: 'rgba(127,127,127,0.04)' },
-  sourceRow: { display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', borderBottom: '1px solid rgba(127,127,127,0.12)' },
-  sourceLabel: { display: 'flex', flexDirection: 'column' as const, gap: 4, fontSize: 12, color: 'rgba(127,127,127,0.85)' },
-  sourceInput: { padding: '7px 9px', borderRadius: 6, border: '1px solid rgba(127,127,127,0.3)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13 },
-  previewToolbar: { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', borderBottom: '1px solid rgba(127,127,127,0.14)' },
+  sourceForm: { display: 'flex', flexDirection: 'column' as const, gap: 16, marginTop: 24, padding: 20, borderRadius: 12, border: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 2%, transparent)' },
+  sourceRow: { display: 'flex', alignItems: 'flex-start', gap: 20, padding: 20, borderRadius: 12, border: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 2%, transparent)' },
+  sourceLabel: { display: 'flex', flexDirection: 'column' as const, gap: 6, minWidth: 0, fontSize: 12, fontWeight: 600 },
+  sourceInput: { width: '100%', minWidth: 0, padding: '9px 11px', borderRadius: 8, border: '1px solid color-mix(in srgb, currentColor 20%, transparent)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 13, fontWeight: 400 },
+  previewToolbar: { borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)', background: 'color-mix(in srgb, currentColor 2%, transparent)' },
   previewScreen: { display: 'flex', flexDirection: 'column' as const, flex: 1, minHeight: 0, minWidth: 0 },
   previewContent: { margin: 0, padding: 16, whiteSpace: 'pre-wrap' as const, overflowWrap: 'anywhere' as const, lineHeight: 1.65, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12 },
-  footer: { padding: '7px 12px', borderTop: '1px solid rgba(127,127,127,0.18)', color: 'rgba(127,127,127,0.75)', fontSize: 11, display: 'flex', gap: 12, flexWrap: 'wrap' as const },
+  footer: { padding: '9px 20px', borderTop: '1px solid rgba(127,127,127,0.14)', color: 'rgba(127,127,127,0.75)', fontSize: 11, display: 'flex', gap: 12, flexWrap: 'wrap' as const },
   workspace: { display: 'flex', flexDirection: 'column' as const, flex: 1, minHeight: 0 },
-  sidebar: { minHeight: 38, display: 'flex', flexDirection: 'row' as const, alignItems: 'center', gap: 3, padding: '5px 12px', borderBottom: '1px solid color-mix(in srgb, currentColor 12%, transparent)', background: 'color-mix(in srgb, currentColor 3%, transparent)' },
+  sidebar: { minHeight: 38, display: 'flex', flexDirection: 'row' as const, alignItems: 'center', gap: 4, padding: '8px 20px', overflowX: 'auto' as const, borderBottom: '1px solid color-mix(in srgb, currentColor 10%, transparent)' },
   sidebarLabel: { padding: '0 9px 7px', fontSize: 10, color: 'rgba(127,127,127,.85)', fontWeight: 650, letterSpacing: '.45px', textTransform: 'uppercase' as const },
-  sidebarNav: (active: boolean) => ({ display: 'flex', alignItems: 'center', gap: 9, padding: '6px 10px', border: 0, borderRadius: 7, cursor: 'pointer', textAlign: 'left' as const, font: 'inherit', fontSize: 12, color: 'inherit', background: active ? 'color-mix(in srgb, currentColor 12%, transparent)' : 'transparent', fontWeight: active ? 600 : 400, whiteSpace: 'nowrap' as const }),
+  sidebarNav: (active: boolean) => ({ display: 'flex', alignItems: 'center', gap: 9, padding: '8px 12px', border: 0, borderRadius: 8, cursor: 'pointer', textAlign: 'left' as const, font: 'inherit', fontSize: 12, color: 'inherit', background: active ? 'color-mix(in srgb, currentColor 12%, transparent)' : 'transparent', fontWeight: active ? 600 : 400, whiteSpace: 'nowrap' as const }),
 }
 
 const KIND_TONE: Record<InboxItem['kind'], string> = { create: '#8fd08a', append: '#d0b98f', update: '#8fb4d0' }
@@ -129,19 +129,13 @@ export interface KnowledgePanelViewProps {
 function hitTone(kind: InboxItem['kind']): string { return KIND_TONE[kind] }
 function statusTone(status: InboxItem['status']): string { return STATUS_TONE[status] }
 
-function sessionResourceAddress(sessionId: string, sourcePath: string, relPath: string): string {
-  const fullPath = `${sourcePath.replace(/[\\/]+$/u, '')}/${relPath}`.replace(/\\/gu, '/')
-  const encodedPath = fullPath.split('/').map((segment) => encodeURIComponent(segment)
-    .replace(/%3A/giu, ':').replace(/\(/gu, '%28').replace(/\)/gu, '%29')).join('/')
-  return `dsh-resource://file/session/${encodeURIComponent(sessionId)}/${encodedPath}`
-}
-
 export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): ReactElement {
   const active = useLocale(ctx)
   const t = useMemo(() => knowledgeT(active), [active])
   const [tab, setTab] = useState<PanelTab>('search')
   const [query, setQuery] = useState('')
   const [sourceId, setSourceId] = useState<string>('')
+  const [searchField, setSearchField] = useState<NonNullable<SearchOptions['field']>>('all')
   const [browseSourceId, setBrowseSourceId] = useState<string>('')
   const [browsePath, setBrowsePath] = useState('')
   const [browseResult, setBrowseResult] = useState<BrowseOk | null>(null)
@@ -169,6 +163,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   const [confirmSourceId, setConfirmSourceId] = useState<string | null>(null)
   const [sourceRemovalLoading, setSourceRemovalLoading] = useState(false)
   const [hits, setHits] = useState<SearchHit[]>([])
+  const [searchTruncated, setSearchTruncated] = useState(false)
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState<string | null>(null)
   const [openError, setOpenError] = useState<string | null>(null)
@@ -185,6 +180,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   const [confirmRevision, setConfirmRevision] = useState<number | null>(null)
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set())
   const panelRootRef = useRef<HTMLDivElement | null>(null)
+  const imageReadQueue = useRef<Promise<void>>(Promise.resolve())
   const sourceRefreshSequence = useRef(0)
   const documentReadSequence = useRef(0)
   const searchSequence = useRef(0)
@@ -340,10 +336,10 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
   }, [refreshSources, tab])
 
   useEffect(() => {
-    if (!needsSourceRefresh) return
-    const timer = setInterval(() => { void refreshSources() }, 750)
+    if (!needsSourceRefresh && tab !== 'sources') return
+    const timer = setInterval(() => { void refreshSources() }, needsSourceRefresh ? 750 : 2000)
     return () => clearInterval(timer)
-  }, [refreshSources, needsSourceRefresh])
+  }, [refreshSources, needsSourceRefresh, tab])
 
   useEffect(() => {
     void rpc.listInbox().then((result) => {
@@ -387,7 +383,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     return () => { cancelled = true }
   }, [tab, browseSelection, browsePath, selectedBrowseSource?.indexedAt, selectedBrowseSource?.lastError, rpc])
 
-  const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string, headingFragment?: string): Promise<void> => {
+  const readAndPreviewDocument = async (source: KnowledgeSourceInfo, relPath: string, headingFragment?: string, returnToBrowse = false): Promise<void> => {
     if (editingDocument && previewDocument && editContent !== previewDocument.content && !window.confirm('Discard unsaved note changes?')) return
     const requestId = ++documentReadSequence.current
     setOpenError(null)
@@ -397,7 +393,11 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
       if (result.ok) {
         setEditingDocument(false)
         setEditContent(result.content)
-        const returnTab = tab === 'browse' ? 'browse' : tab === 'preview' ? previewReturnTab : 'search'
+        const returnTab = returnToBrowse || tab === 'browse' ? 'browse' : tab === 'preview' ? previewReturnTab : 'search'
+        if (returnToBrowse) {
+          setBrowseSourceId(source.id)
+          setBrowsePath(relPath.split('/').slice(0, -1).join('/'))
+        }
         setPreviewReturnTab(returnTab)
         setPreviewDocument(result)
         setPendingHeadingFragment(headingFragment ?? null)
@@ -549,46 +549,17 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     }
   }
 
-  const openNativeFile = (source: KnowledgeSourceInfo, relPath: string, line: number | null): void => {
-    const hostContext = ctx as unknown as {
-      sidebarRight?: {
-        mounted: { getSnapshot(): string | undefined }
-        openResource(address: string, options?: { params?: { line?: number } }): void
-      }
-      layout?: { selectPanel(panelId: string | null): void }
-    }
-    const navigation = hostContext.sidebarRight
-    if (!navigation) {
-      setOpenError(t('nativeOpenUnavailable'))
-      return
-    }
-    let sessionId = navigation.mounted.getSnapshot()
-    if (!sessionId) {
-      hostContext.layout?.selectPanel(null)
-      sessionId = navigation.mounted.getSnapshot()
-    }
-    if (!sessionId) {
-      setOpenError(t('nativeOpenUnavailable'))
-      return
-    }
-    const address = sessionResourceAddress(sessionId, source.path, relPath)
-    try {
-      navigation.openResource(address, line === null ? undefined : { params: { line } })
-    } catch (error) {
-      setOpenError(error instanceof Error ? error.message : String(error))
-    }
-  }
-
   const runSearch = useCallback((searchQuery = query, searchSource = sourceId) => {
     const requestId = ++searchSequence.current
     const trimmed = searchQuery.trim()
     setSearchError(null)
+    setSearchTruncated(false)
     if (trimmed === '') { setHits([]); setSearching(false); return }
     setSearching(true)
-    void rpc.search(trimmed, { sourceId: searchSource || undefined, field: 'all', limit: 30 })
+    void rpc.search(trimmed, { sourceId: searchSource || undefined, field: searchField, limit: 30 })
       .then((result) => {
         if (requestId !== searchSequence.current) return
-        if (result.ok) setHits(result.hits)
+        if (result.ok) { setHits(result.hits); setSearchTruncated(result.truncated) }
         else { setHits([]); setSearchError(result.message) }
       })
       .catch((error) => {
@@ -599,7 +570,16 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
       .finally(() => {
         if (requestId === searchSequence.current) setSearching(false)
       })
-  }, [query, rpc, sourceId])
+  }, [query, rpc, sourceId, searchField])
+
+  const prepareSearch = (nextQuery: string): void => {
+    searchSequence.current += 1
+    setHits([])
+    setSearchError(null)
+    setSearchTruncated(false)
+    setCopyFeedback(null)
+    setSearching(nextQuery.trim() !== '')
+  }
 
   useEffect(() => {
     if (tab !== 'search') return
@@ -741,6 +721,19 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
     await readAndPreviewDocument(source, relativePath, fragment)
   }
 
+  const loadPreviewImage = useCallback(async (relativePath: string, signal: AbortSignal): Promise<string> => {
+    if (!previewDocument) throw new Error('No document selected')
+    const source = previewDocument.sourceId
+    const request = imageReadQueue.current.then(async () => {
+      signal.throwIfAborted()
+      const result = await rpc.readImage(source, relativePath, signal)
+      if (!result.ok) throw new Error(result.message)
+      return result.dataUrl
+    })
+    imageReadQueue.current = request.then(() => undefined, () => undefined)
+    return request
+  }, [previewDocument?.sourceId, rpc])
+
   return (
     <div ref={panelRootRef} className="knowledge-panel" style={s.root}>
       <style>{`
@@ -748,20 +741,49 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
         .knowledge-sidebar>div:first-child{display:none}
         .knowledge-sidebar>div:last-child{margin-left:auto!important;margin-top:0!important;padding:0!important;border:0!important}
         .knowledge-file-row{min-width:0;flex-wrap:wrap}
+        .knowledge-file-row:not(:disabled):hover{background:color-mix(in srgb,currentColor 6%,transparent)!important;border-color:color-mix(in srgb,currentColor 22%,transparent)!important}
+        .knowledge-search-title:hover{text-decoration:underline}
+        .knowledge-search-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+        .knowledge-preview-toolbar-inner{display:flex;align-items:center;gap:16px;padding:14px 28px}
+        .knowledge-preview-back{display:inline-flex;align-items:center;justify-content:center;gap:5px;flex:none;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:12px;font-weight:600;white-space:nowrap}
+        .knowledge-preview-back:hover{background:color-mix(in srgb,currentColor 7%,transparent)}
+        .knowledge-preview-details{flex:1;min-width:0;padding-left:16px;border-left:1px solid color-mix(in srgb,currentColor 14%,transparent)}
+        .knowledge-preview-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:650}
+        .knowledge-preview-path{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;font-size:11px;color:color-mix(in srgb,currentColor 58%,transparent)}
+        .knowledge-preview-actions{display:flex;align-items:center;gap:8px;flex:none}
+        .knowledge-preview-actions button{white-space:nowrap}
+        .knowledge-panel *, .knowledge-panel *::before, .knowledge-panel *::after{box-sizing:border-box}
+        .knowledge-panel button, .knowledge-panel input, .knowledge-panel select, .knowledge-panel textarea{transition:border-color 140ms ease,background-color 140ms ease,box-shadow 140ms ease,opacity 140ms ease}
+        .knowledge-panel button:not(:disabled):hover{filter:brightness(.96)}
+        .knowledge-panel button:disabled{cursor:not-allowed;opacity:.5}
+        .knowledge-panel :is(button,input,select,textarea):focus-visible{outline:2px solid #3478f6;outline-offset:2px}
+        .knowledge-panel [role=alert]{color:#d45c54}
+        @container knowledgePanel (max-width:700px){
+          .knowledge-inbox-grid{grid-template-columns:minmax(0,1fr)!important}
+          .knowledge-inbox-grid>div:first-child{max-height:240px!important}
+        }
         @container knowledgePanel (max-width:520px){
+          .knowledge-preview-toolbar-inner{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px 12px;padding:12px 16px}
+          .knowledge-preview-details{padding-left:12px}
+          .knowledge-preview-actions{grid-column:1 / -1;justify-content:flex-end}
+          .knowledge-source-row{flex-direction:column;gap:14px!important}
+          .knowledge-source-actions{align-self:stretch}
+          .knowledge-source-fields{grid-template-columns:minmax(0,1fr)!important}
+          .knowledge-source-path{flex-wrap:wrap}
+          .knowledge-source-path input{flex-basis:100%!important}
           .knowledge-browse-toolbar{display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;gap:6px!important;padding:8px!important}
           .knowledge-browse-toolbar select{min-width:0!important;max-width:none!important}
           .knowledge-browse-toolbar>span{display:none}
           .knowledge-browse-toolbar button{white-space:nowrap;padding:5px 8px!important}
           .knowledge-file-row{gap:5px!important;padding:8px!important}
-          .knowledge-file-row>div{flex:1 1 100%!important}
-          .knowledge-file-row button{padding:4px 7px!important;font-size:11px!important}
+          .knowledge-file-row .knowledge-file-details{flex:1 1 70%!important}
           .knowledge-search-row{flex-wrap:wrap}
           .knowledge-search-row input{flex-basis:100%}
+          .knowledge-panel{font-size:12px}
         }
       `}</style>
       <div style={s.header}>
-        <span style={{ fontWeight: 600, fontSize: 13 }}>{t('panelLabel')}</span>
+        <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.25px' }}>{t('panelLabel')}</span>
         <div style={{ flex: 1 }} />
         <button style={s.button()} disabled={savingDocument} onClick={() => switchTab('sources')}>{t('sourcesLabel')}</button>
       </div>
@@ -780,43 +802,57 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
             <input
               style={s.input}
               value={query}
+              aria-label={t('searchPlaceholder')}
               placeholder={t('searchPlaceholder')}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => { prepareSearch(event.target.value); setQuery(event.target.value) }}
               onKeyDown={(event) => { if (event.key === 'Enter') runSearch() }}
             />
-            <select style={s.select} value={sourceId} onChange={(event) => setSourceId(event.target.value)}>
-              <option value="">{t('sourcesLabel')} · All</option>
+            {query ? <button type="button" style={s.button()} onClick={() => { prepareSearch(''); setQuery('') }}>{t('searchClear')}</button> : null}
+            <select aria-label={t('sourcesLabel')} style={s.select} value={sourceId} onChange={(event) => { prepareSearch(query); setSourceId(event.target.value) }}>
+              <option value="">{t('searchAllSources')}</option>
               {sources.map((source) => (
                 <option key={source.id} value={source.id}>{source.name}</option>
               ))}
             </select>
-            <button style={s.button('primary')} disabled={searching} onClick={() => runSearch()}>
-              {searching ? '…' : t('searchResults')}
+            <select aria-label={t('searchField')} style={s.select} value={searchField} onChange={(event) => { prepareSearch(query); setSearchField(event.target.value as NonNullable<SearchOptions['field']>) }}>
+              <option value="all">{t('searchFieldAll')}</option>
+              <option value="title">{t('searchFieldTitle')}</option>
+              <option value="body">{t('searchFieldBody')}</option>
+              <option value="tags">{t('searchFieldTags')}</option>
+              <option value="links">{t('searchFieldLinks')}</option>
+            </select>
+            <button style={s.button('primary')} onClick={() => runSearch()}>
+              {t('searchAction')}
             </button>
           </div>
           <div style={s.body}>
             {sourceError ? <div style={s.empty} role="alert">{sourceError}</div> : null}
             {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
             {searchError ? <div style={s.empty} role="alert">{t('searchFailed')}: {searchError}</div> : null}
-            {hits.length === 0 && !searchError ? (
-              <div style={s.empty}>{query.trim() === '' ? t('searchIdle') : t('searchEmpty')}</div>
+            {copyFeedback ? <div role="status" style={{ ...s.hitMeta, marginBottom: 12 }}>{copyFeedback}</div> : null}
+            {query.trim() !== '' && !searchError ? <div role="status" style={{ ...s.hitMeta, margin: '0 0 12px', fontWeight: 600 }}>
+              {searching ? t('searchLoading') : (searchTruncated ? t('searchTruncated') : t('searchCount')).replace('{count}', String(hits.length))}
+            </div> : null}
+            {hits.length === 0 && !searchError && !searching ? (
+              <div style={{ ...s.empty, border: '1px dashed color-mix(in srgb, currentColor 16%, transparent)', borderRadius: 12 }}>{query.trim() === '' ? t('searchIdle') : t('searchEmpty')}</div>
             ) : hits.map((hit) => {
               const source = sources.find((entry) => entry.id === hit.sourceId)
               return (
                 <div key={`${hit.sourceId}/${hit.path}`} style={s.hit}>
-                  <div style={s.hitTitle}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{hit.title}</span>
-                    {source ? <>
-                      <button style={s.button()} onClick={() => void readAndPreviewDocument(source, hit.path)}>{t('openFile')}</button>
-                      <button style={s.button()} onClick={() => openNativeFile(source, hit.path, hit.line)}>{t('openInDsh')}</button>
-                    </> : null}
-                  </div>
+                  <div style={s.hitTitle}>{source
+                    ? <button type="button" className="knowledge-search-title" style={{ padding: 0, border: 0, background: 'none', color: 'inherit', font: 'inherit', textAlign: 'left', cursor: 'pointer', overflowWrap: 'anywhere' }} onClick={() => void readAndPreviewDocument(source, hit.path)}>{hit.title}</button>
+                    : <span>{hit.title}</span>}</div>
                   <div style={s.hitMeta}>{source?.name ?? hit.sourceId} · {hit.path}{hit.line === null ? '' : ` · ${t('matchLine')} ${hit.line}`}</div>
-                  {hit.snippet ? <div style={s.hitSnippet}>{hit.snippet}</div> : null}
-                  <button type="button" style={{ ...s.button(), marginTop: 5 }} onClick={() => void copyCitation(hit, source)}>{t('copyCitation')}</button>
+                  {hit.snippet ? <div style={s.hitSnippet}>{hit.snippet.split(/(⟦[^⟧]*⟧)/u).map((part, index) => part.startsWith('⟦') && part.endsWith('⟧')
+                    ? <mark key={index} style={{ background: 'rgba(224, 176, 63, 0.28)', color: 'inherit', borderRadius: 3 }}>{part.slice(1, -1)}</mark>
+                    : part)}</div> : null}
                   {hit.tags.length > 0 ? (
                     <div style={s.tags}>{hit.tags.map((tag) => <span key={tag} style={s.tag}>#{tag}</span>)}</div>
                   ) : null}
+                  <div className="knowledge-search-actions">
+                    {source ? <button type="button" style={s.button()} onClick={() => void readAndPreviewDocument(source, hit.path, undefined, true)}>{t('openInBrowse')}</button> : null}
+                    <button type="button" style={s.button()} onClick={() => void copyCitation(hit, source)}>{t('copyCitation')}</button>
+                  </div>
                 </div>
               )
             })}
@@ -825,24 +861,33 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
       ) : tab === 'preview' ? (
         <div style={s.previewScreen}>
           <div style={s.previewToolbar}>
-            <button style={s.button()} disabled={savingDocument} onClick={() => switchTab(previewReturnTab)}>{t('previewBack')}</button>
-            {previewDocument ? (
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontWeight: 600 }}>{previewDocument.title}</div>
-                <div style={s.hitMeta}>{previewDocument.sourceId} · {previewDocument.path}</div>
+            <div className="knowledge-preview-toolbar-inner">
+              <button className="knowledge-preview-back" disabled={savingDocument} onClick={() => switchTab(previewReturnTab)}>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5M5.75 8H13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                {t('previewBack')}
+              </button>
+              {previewDocument ? (
+                <div className="knowledge-preview-details">
+                  <div className="knowledge-preview-title" title={previewDocument.title}>{previewDocument.title}</div>
+                  <div className="knowledge-preview-path" title={previewDocument.path}>
+                    {[sources.find((source) => source.id === previewDocument.sourceId)?.name, previewDocument.path].filter(Boolean).join(' · ')}
+                  </div>
+                </div>
+              ) : <div style={{ flex: 1 }} />}
+              <div className="knowledge-preview-actions">
+                {previewDocument ? <button type="button" style={s.button()} onClick={() => void copyPreviewPath()}>{t('copyPath')}</button> : null}
+                {!editingDocument && previewDocument?.path ? <button type="button" style={s.button('primary')} onClick={() => { setEditContent(previewDocument.content); setEditingDocument(true) }}>编辑笔记</button> : null}
+                {editingDocument ? <button type="button" style={s.button()} disabled={savingDocument} onClick={() => {
+                  if ((editContent !== (previewDocument?.content ?? '') || newNoteTitle.trim() !== '') && !window.confirm('Discard unsaved note changes?')) return
+                  setEditingDocument(false)
+                  setEditContent(previewDocument?.content ?? '')
+                  setNewNoteTitle('')
+                  setNewNoteDirectoryPath('')
+                  if (previewDocument?.path === '') { setPreviewDocument(null); setTab(previewReturnTab) }
+                }}>取消</button> : null}
+                {editingDocument ? <button type="button" style={s.button('primary')} disabled={savingDocument} onClick={() => void saveDocument()}>{savingDocument ? '保存中…' : '保存'}</button> : null}
               </div>
-            ) : null}
-            {previewDocument ? <button type="button" style={s.button()} onClick={() => void copyPreviewPath()}>{t('copyPath')}</button> : null}
-            {!editingDocument && previewDocument?.path ? <button type="button" style={s.button()} onClick={() => { setEditContent(previewDocument.content); setEditingDocument(true) }}>编辑笔记</button> : null}
-            {editingDocument ? <button type="button" style={s.button()} disabled={savingDocument} onClick={() => {
-              if ((editContent !== (previewDocument?.content ?? '') || newNoteTitle.trim() !== '') && !window.confirm('Discard unsaved note changes?')) return
-              setEditingDocument(false)
-              setEditContent(previewDocument?.content ?? '')
-              setNewNoteTitle('')
-              setNewNoteDirectoryPath('')
-              if (previewDocument?.path === '') { setPreviewDocument(null); setTab(previewReturnTab) }
-            }}>取消</button> : null}
-            {editingDocument ? <button type="button" style={s.button('primary')} disabled={savingDocument} onClick={() => void saveDocument()}>{savingDocument ? '保存中…' : '保存'}</button> : null}
+            </div>
           </div>
           {copyFeedback ? <div role="status" style={s.hitMeta}>{copyFeedback}</div> : null}
           {openError ? <div style={s.empty} role="alert">{openError}</div> : null}
@@ -852,7 +897,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
           <div style={{ ...s.body, padding: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             {editingDocument ? <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, minHeight: 0, padding: 16 }}>
               <textarea aria-label="Markdown note content" value={editContent} readOnly={savingDocument} onChange={(event) => setEditContent(event.target.value)} autoFocus={previewDocument?.version !== ''} style={{ flex: 1, minHeight: 0, width: '100%', resize: 'none', border: '1px solid rgba(127,127,127,.2)', borderRadius: 8, padding: 16, background: 'transparent', color: 'inherit', font: '13px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace' }} />
-            </div> : previewDocument ? <MarkdownView content={previewDocument.content} links={previewDocument.links} onNavigate={(path, fragment) => void openLinkedDocument(path, fragment)} /> : null}
+            </div> : previewDocument ? <MarkdownView content={previewDocument.content} links={previewDocument.links} onNavigate={(path, fragment) => void openLinkedDocument(path, fragment)} documentPath={previewDocument.path} loadImage={loadPreviewImage} imageLoading={t('imageLoading')} imageFailed={t('imageFailed')} imageLimit={t('imageLimit')} /> : null}
           </div>
         </div>
       ) : tab === 'browse' ? (
@@ -910,18 +955,15 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
                 ))}
                 {browseResult.documents.map((document) => {
                   const source = sources.find((entry) => entry.id === document.sourceId)
-                  const canOpen = source !== undefined
                   return (
-                    <div key={`doc:${document.path}`} className="knowledge-file-row" style={s.row}>
+                    <button key={`doc:${document.path}`} type="button" className="knowledge-file-row" disabled={!source} onClick={() => { if (source) void readAndPreviewDocument(source, document.path) }} style={{ ...s.row, width: '100%', color: 'inherit', font: 'inherit', textAlign: 'left', cursor: 'pointer' }}>
                       <span aria-hidden>▤</span>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{document.title}</div>
-                        <div style={s.hitMeta}>{document.path}</div>
-                      </div>
-                      {canOpen && source ? <>
-                        <button style={s.button()} onClick={() => void readAndPreviewDocument(source, document.path)}>{t('openFile')}</button>
-                      </> : null}
-                    </div>
+                      <span className="knowledge-file-details" style={{ flex: 1, minWidth: 0 }}>
+                        <span style={{ display: 'block', fontWeight: 600, fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{document.title}</span>
+                        <span style={{ ...s.hitMeta, display: 'block' }}>{document.path}</span>
+                      </span>
+                      {source ? <span aria-hidden="true" style={{ ...s.button(), display: 'inline-block' }}>{t('openFile')}</span> : null}
+                    </button>
                   )
                 })}
               </>
@@ -930,44 +972,55 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
         </div>
       ) : tab === 'sources' ? (
         <div style={s.body}>
-          <div style={{ maxWidth: 760, margin: '0 auto' }}>
+          <div style={{ maxWidth: 760, margin: '12px auto 0' }}>
             {sourceError ? <div style={s.empty} role="alert">{sourceError}</div> : null}
-            {sources.length === 0 ? <div style={s.empty}>{t('sourcesEmpty')}</div> : sources.map((source) => (
-              <div key={source.id} style={s.sourceRow}>
-                <span style={s.badge(source.kind === 'vault' ? '#8fd08a' : '#8fb4d0')}>{source.kind === 'vault' ? t('settingsSourceKindVault') : t('settingsSourceKindFolder')}</span>
+            <h2 style={{ margin: '0 0 12px', fontSize: 15, fontWeight: 650 }}>{t('sourcesLabel')}</h2>
+            {sources.length === 0 ? <div style={{ ...s.empty, padding: '24px 16px', border: '1px dashed color-mix(in srgb, currentColor 18%, transparent)', borderRadius: 12 }}>{t('sourcesEmpty')}</div> : sources.map((source) => (
+              <div key={source.id} className="knowledge-source-row" style={{ ...s.sourceRow, marginBottom: 8 }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 600 }}>{source.name}</div>
-                  <div style={{ ...s.hitMeta, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{source.path}</div>
-                  <div style={s.hitMeta}>{source.lastError ?? (busyIds.has(source.id) || source.indexedAt === null ? t('sourceReindexing') : `${source.fileCount} · ${new Date(source.indexedAt).toLocaleString()}`)}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                    <span style={{ fontWeight: 650, fontSize: 14, overflowWrap: 'anywhere' }}>{source.name}</span>
+                    <span style={s.badge(source.kind === 'vault' ? '#8fd08a' : '#8fb4d0')}>{source.kind === 'vault' ? t('settingsSourceKindVault') : t('settingsSourceKindFolder')}</span>
+                  </div>
+                  <div style={{ ...s.hitMeta, marginTop: 8 }}>{source.path}</div>
+                  <div role={source.lastError ? 'alert' : 'status'} style={{ ...s.hitMeta, marginTop: 8, fontWeight: 600, color: source.lastError ? '#c84d45' : 'inherit' }}>
+                    {source.lastError ? t('sourceIndexFailed') : busyIds.has(source.id) || source.isIndexing || source.indexedAt === null ? t('sourceReindexing') : t('sourceIndexReady')}
+                  </div>
+                  {source.lastError ? <div style={s.hitMeta}>{source.lastError}</div> : null}
+                  {source.indexedAt !== null ? <div style={s.hitMeta}>{t('sourceIndexedAt').replace('{count}', String(source.fileCount)).replace('{time}', new Date(source.indexedAt).toLocaleString())}</div> : null}
                   {source.lastError ? <div style={s.hitMeta}>{t('sourceErrorHelp')}</div> : null}
-                  <div style={s.hitMeta}>{t('sourceSkipPolicy')}</div>
+                  <div style={{ ...s.hitMeta, marginTop: 10 }}>{t('sourceSkipPolicy')}</div>
                 </div>
-                <button style={s.button()} disabled={busyIds.has(source.id)} onClick={() => void reindexSource(source)}>{t('sourceReindex')}</button>
-                <button style={s.button('danger')} disabled={busyIds.has(source.id) || sourceRemovalLoading} onClick={() => void requestSourceRemoval(source)}>{t('settingsSourceRemove')}</button>
+                <div className="knowledge-source-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
+                  <button style={s.button()} disabled={busyIds.has(source.id)} onClick={() => void reindexSource(source)}>{t('sourceReindex')}</button>
+                  <button style={s.button('danger')} disabled={busyIds.has(source.id) || sourceRemovalLoading} onClick={() => void requestSourceRemoval(source)}>{t('settingsSourceRemove')}</button>
+                </div>
               </div>
             ))}
             <div style={s.sourceForm}>
-              <div style={{ fontWeight: 600, fontSize: 14 }}>{t('settingsSourceAdd')}</div>
-              <label style={s.sourceLabel}>
-                {t('settingsSourceName')}
-                <input style={s.sourceInput} value={newSourceName} onChange={(event) => setNewSourceName(event.target.value)} maxLength={64} />
-              </label>
+              <h2 style={{ margin: 0, fontWeight: 650, fontSize: 15 }}>{t('settingsSourceAdd')}</h2>
+              <div className="knowledge-source-fields" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(140px, 0.35fr)', gap: 14 }}>
+                <label style={s.sourceLabel}>
+                  {t('settingsSourceName')}
+                  <input style={s.sourceInput} value={newSourceName} onChange={(event) => setNewSourceName(event.target.value)} maxLength={64} />
+                </label>
+                <label style={s.sourceLabel}>
+                  {t('settingsSourceKind')}
+                  <select style={{ ...s.select, maxWidth: 'none', width: '100%', fontWeight: 400 }} value={newSourceKind} onChange={(event) => setNewSourceKind(event.target.value as SourceKind)}>
+                    <option value="folder">{t('settingsSourceKindFolder')}</option>
+                    <option value="vault">{t('settingsSourceKindVault')}</option>
+                  </select>
+                </label>
+              </div>
               <label style={s.sourceLabel}>
                 {t('settingsSourcePath')}
-                <div style={{ display: 'flex', gap: 6 }}>
+                <div className="knowledge-source-path" style={{ display: 'flex', gap: 8 }}>
                   <input style={{ ...s.sourceInput, flex: 1, minWidth: 0 }} value={newSourcePath} onChange={(event) => setNewSourcePath(event.target.value)} placeholder="/absolute/path/to/vault" />
                   <button type="button" style={s.button()} disabled={sourcePicking || sourceSaving} onClick={() => void chooseSourceDirectory()}>{t('settingsPickDirectory')}</button>
                 </div>
               </label>
-              <label style={s.sourceLabel}>
-                {t('settingsSourceKind')}
-                <select style={s.select} value={newSourceKind} onChange={(event) => setNewSourceKind(event.target.value as SourceKind)}>
-                  <option value="folder">{t('settingsSourceKindFolder')}</option>
-                  <option value="vault">{t('settingsSourceKindVault')}</option>
-                </select>
-              </label>
               {sourceFormError ? <div style={{ ...s.hitMeta, color: 'rgba(210,90,70,0.95)' }} role="alert">{sourceFormError}</div> : null}
-              <div style={s.hitMeta}>{t('settingsPathHint')}</div>
+              <div style={{ ...s.hitMeta, marginTop: -8 }}>{t('settingsPathHint')}</div>
               <div><button style={s.button('primary')} disabled={sourceSaving || newSourceName.trim() === '' || newSourcePath.trim() === ''} onClick={() => void addSource()}>{sourceSaving ? '…' : t('settingsSourceAdd')}</button></div>
             </div>
           </div>
@@ -982,7 +1035,7 @@ export function KnowledgePanelView({ ctx, rpc }: KnowledgePanelViewProps): React
             })}
           </div>
           {items.length === 0 ? <div style={s.empty}>{t('inboxEmpty')}</div> : (
-            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.34fr) minmax(0, 1fr)', gap: 12, minHeight: 0 }}>
+            <div className="knowledge-inbox-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.34fr) minmax(0, 1fr)', gap: 12, minHeight: 0, marginTop: 14 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: '100%', overflowY: 'auto' }} aria-label="Proposals">
                 {filteredInboxItems.map((item) => (
                   <button key={item.id} type="button" aria-pressed={selectedInboxItem?.id === item.id} onClick={() => { setSelectedInboxId(item.id); setEditingInboxId(null); setConflictDocument(null) }} style={{ ...s.row, cursor: 'pointer', textAlign: 'left', background: selectedInboxItem?.id === item.id ? 'rgba(68,120,255,0.12)' : 'rgba(127,127,127,0.06)' }}>

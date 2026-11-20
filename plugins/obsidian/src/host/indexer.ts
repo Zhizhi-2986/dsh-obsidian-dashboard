@@ -224,12 +224,14 @@ export class KnowledgeIndex {
     const matchQuery = field === undefined || field === 'all' ? ftsQuery : `${column} : (${ftsQuery})`
     const lineStart = `\uE000${randomUUID()}\uE001`
     const lineEnd = `\uE002${randomUUID()}\uE003`
+    const terms = toSearchTerms(rawQuery)
+    const chineseTerms = terms.filter((term) => /\p{Script=Han}/u.test(term))
     let sql = `
       WITH matching AS MATERIALIZED (
       SELECT d.source_id, d.rel_path, d.title, d.tags, d.mtime_ms,
              snippet(docs_fts, ${BODY_COLUMN_INDEX}, '⟦', '⟧', ' … ', 24) AS snippet,
              highlight(docs_fts, ${BODY_COLUMN_INDEX}, '${lineStart}', '${lineEnd}') AS marked_body,
-             rank AS score
+             docs_fts.body AS body, rank AS score, 0 AS origin
       FROM docs_fts
       JOIN docs d ON d.source_id = docs_fts.source_id AND d.rel_path = docs_fts.rel_path
       WHERE docs_fts MATCH ?
@@ -239,17 +241,38 @@ export class KnowledgeIndex {
       sql += ' AND d.source_id = ?'
       params.push(sourceId)
     }
+    if (chineseTerms.length > 0) {
+      const columns = field === 'title' ? ['title'] : field === 'tags' ? ['tags'] : field === 'body' ? ['body'] : ['title', 'tags', 'body']
+      const clauses = chineseTerms.map((term) => {
+        params.push(...columns.map(() => term))
+        return `(${columns.map((name) => `instr(docs_fts.${name}, ?) > 0`).join(' OR ')})`
+      })
+      sql += `
+      UNION ALL
+      SELECT d.source_id, d.rel_path, d.title, d.tags, d.mtime_ms,
+             NULL AS snippet, NULL AS marked_body, docs_fts.body AS body, 0 AS score, 1 AS origin
+      FROM docs_fts
+      JOIN docs d ON d.source_id = docs_fts.source_id AND d.rel_path = docs_fts.rel_path
+      WHERE (${clauses.join(' OR ')})`
+      if (sourceId !== undefined) { sql += ' AND d.source_id = ?'; params.push(sourceId) }
+    }
     sql += `
+      ), deduplicated AS (
+        SELECT *, row_number() OVER (PARTITION BY source_id, rel_path ORDER BY origin) AS position
+        FROM matching
       )
-      SELECT source_id, rel_path, title, tags, mtime_ms, snippet,
+      SELECT source_id, rel_path, title, tags, mtime_ms, snippet, body, origin,
         CASE WHEN instr(marked_body, ?) = 0 THEN NULL ELSE
           length(substr(marked_body, 1, instr(marked_body, ?) - 1)) -
           length(replace(substr(marked_body, 1, instr(marked_body, ?) - 1), char(10), '')) + 1
         END AS line
-      FROM matching
+      FROM deduplicated WHERE position = 1
     `
     params.push(lineStart, lineStart, lineStart)
-    sql += ' ORDER BY score LIMIT ?'
+    const matchedTerms = terms.map(() => 'CASE WHEN instr(lower(title || char(10) || tags || char(10) || body), lower(?)) > 0 THEN 1 ELSE 0 END').join(' + ')
+    sql += ` ORDER BY CASE WHEN instr(lower(title), lower(?)) > 0 THEN 0 ELSE 1 END,
+      (${matchedTerms}) DESC, CASE WHEN instr(lower(body), lower(?)) > 0 THEN 0 ELSE 1 END, score, source_id, rel_path LIMIT ?`
+    params.push(rawQuery.trim(), ...terms, rawQuery.trim())
     params.push(limit)
 
     const rows = this.#db.prepare(sql).all(...params) as Array<{
@@ -260,16 +283,25 @@ export class KnowledgeIndex {
       mtime_ms: number | null
       snippet: string | null
       line: number | null
+      body: string
+      origin: number
     }>
-    return rows.map((row) => ({
-      sourceId: row.source_id,
-      path: row.rel_path,
-      title: row.title,
-      tags: JSON.parse(row.tags) as string[],
-      updatedAt: row.mtime_ms,
-      snippet: row.snippet,
-      line: row.line,
-    }))
+    return rows.map((row) => {
+      const match = row.origin === 1 && field !== 'title' && field !== 'tags'
+        ? chineseTerms.map((term) => ({ term, index: row.body.indexOf(term) })).filter((entry) => entry.index >= 0).sort((a, b) => a.index - b.index)[0]
+        : undefined
+      const start = match ? Math.max(0, match.index - 80) : 0
+      const end = match ? Math.min(row.body.length, match.index + match.term.length + 80) : 0
+      return {
+        sourceId: row.source_id,
+        path: row.rel_path,
+        title: row.title,
+        tags: JSON.parse(row.tags) as string[],
+        updatedAt: row.mtime_ms,
+        snippet: match ? `${start > 0 ? '… ' : ''}${row.body.slice(start, match.index)}⟦${match.term}⟧${row.body.slice(match.index + match.term.length, end)}${end < row.body.length ? ' …' : ''}` : row.snippet,
+        line: match ? row.body.slice(0, match.index).split('\n').length : row.line,
+      }
+    })
   }
 
   #searchLinks(sourceId: string | undefined, rawQuery: string, limit: number): SearchHit[] {
